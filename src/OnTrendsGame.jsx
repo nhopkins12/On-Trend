@@ -38,6 +38,15 @@ function stripXssi(text) {
   return text.replace(/^\)\]\}',?\n/, "");
 }
 
+function decodeXmlEntities(input) {
+  return String(input || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
 function sanitizeTrendTerm(input) {
   const cleaned = String(input || "").replace(/\s+/g, " ").trim();
   if (cleaned.length < 2 || cleaned.length > 80) return null;
@@ -58,6 +67,61 @@ const LOW_SIGNAL_TERMS = new Set([
   "stories",
   "update",
 ]);
+const NON_NOUN_TOKENS = new Set([
+  "is",
+  "are",
+  "was",
+  "were",
+  "be",
+  "being",
+  "been",
+  "am",
+  "do",
+  "does",
+  "did",
+  "doing",
+  "have",
+  "has",
+  "had",
+  "can",
+  "could",
+  "should",
+  "would",
+  "may",
+  "might",
+  "must",
+  "will",
+  "shall",
+  "go",
+  "goes",
+  "went",
+  "going",
+  "get",
+  "gets",
+  "got",
+  "make",
+  "makes",
+  "made",
+  "say",
+  "says",
+  "said",
+  "watch",
+  "stream",
+  "live",
+  "see",
+  "know",
+  "find",
+  "buy",
+  "sell",
+  "trade",
+  "play",
+  "playing",
+  "played",
+  "win",
+  "won",
+  "lose",
+  "lost",
+]);
 
 function isLikelyLowSignal(term, score) {
   const normalized = String(term || "").toLowerCase();
@@ -72,6 +136,23 @@ function isLikelyLowSignal(term, score) {
   if (normalized.length <= 4 && score < 50) return true;
 
   return false;
+}
+
+function isPuzzleFriendlyTerm(term) {
+  const normalized = String(term || "").trim();
+  if (!normalized) return false;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length > 5) return false;
+  if (normalized.length > 48) return false;
+  if (/\b(update|live|radar|video|stream|breaking)\b/i.test(normalized)) return false;
+  const tokens = normalized
+    .toLowerCase()
+    .split(/[^a-z0-9']+/)
+    .filter(Boolean);
+  if (!tokens.length) return false;
+  const nonNounCount = tokens.filter((t) => NON_NOUN_TOKENS.has(t)).length;
+  if (nonNounCount > 0) return false;
+  return true;
 }
 
 function parseItems(rawItems) {
@@ -110,38 +191,116 @@ function todayIdToronto() {
 
 const TOTAL_ITEMS = 5;
 const LOCAL_USER_ID = "local-user";
-const DEFAULT_TIMEFRAME = "now 1-d";
+const DEFAULT_TIMEFRAME = "now 7-d";
 
 
 async function fetchTrendsProxyText(path) {
-  const response = await fetch(`/trends-proxy${path}`, {
-    headers: {
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Proxy request failed (${response.status})`);
+  const maxAttempts = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetch(`/trends-proxy${path}`, {
+        headers: {
+          "Accept-Language": "en-US,en;q=0.9",
+        },
+      });
+
+      if (response.ok) {
+        return response.text();
+      }
+
+      const retryable = response.status === 429 || response.status >= 500;
+      if (retryable && attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        continue;
+      }
+
+      throw new Error(`Proxy request failed (${response.status})`);
+    } catch (err) {
+      lastErr = err;
+      if (attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        continue;
+      }
+    }
   }
-  return response.text();
+
+  throw lastErr || new Error("Proxy request failed");
+}
+
+function parseRssCandidates(xmlText) {
+  const out = [];
+  const blocks = String(xmlText || "").match(/<item>[\s\S]*?<\/item>/g) || [];
+
+  for (const block of blocks) {
+    const m = block.match(/<title>([\s\S]*?)<\/title>/i);
+    if (!m?.[1]) continue;
+    const clean = sanitizeTrendTerm(decodeXmlEntities(m[1]));
+    if (clean) {
+      out.push(clean);
+    }
+  }
+
+  return Array.from(new Set(out));
+}
+
+async function fetchLocalDailyCandidatesFromLegacyApi() {
+  const paths = [
+    "/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
+    "/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
+  ];
+
+  for (const path of paths) {
+    try {
+      const txt = await fetchTrendsProxyText(path);
+      const payload = JSON.parse(stripXssi(txt));
+      const latestDay = payload?.default?.trendingSearchesDays?.[0];
+      const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
+      const out = [];
+      for (const entry of list) {
+        const clean = sanitizeTrendTerm(entry?.title?.query);
+        if (clean) out.push(clean);
+      }
+      const unique = Array.from(new Set(out));
+      if (unique.length) return unique;
+    } catch {
+      // try next variant
+    }
+  }
+
+  return [];
+}
+
+async function fetchLocalDailyCandidatesFromRss() {
+  const geos = ["US"];
+  const merged = [];
+
+  for (const geo of geos) {
+    try {
+      const txt = await fetchTrendsProxyText(`/trending/rss?geo=${encodeURIComponent(geo)}`);
+      merged.push(...parseRssCandidates(txt));
+    } catch {
+      // no-op
+    }
+  }
+
+  return Array.from(new Set(merged));
 }
 
 async function fetchLocalDailyCandidates() {
-  const txt = await fetchTrendsProxyText("/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15");
-  const payload = JSON.parse(stripXssi(txt));
-  const latestDay = payload?.default?.trendingSearchesDays?.[0];
-  const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
+  const legacy = await fetchLocalDailyCandidatesFromLegacyApi();
+  if (legacy.length) return legacy.filter((x) => isPuzzleFriendlyTerm(x));
 
-  const out = [];
-  for (const entry of list) {
-    const clean = sanitizeTrendTerm(entry?.title?.query);
-    if (clean) out.push(clean);
-  }
-  return Array.from(new Set(out));
+  const rss = await fetchLocalDailyCandidatesFromRss();
+  if (rss.length) return rss.filter((x) => isPuzzleFriendlyTerm(x));
+
+  throw new Error("No local candidates available from Google Trends");
 }
 
 async function fetchLocalExploreWidgets(keyword) {
   const req = {
-    comparisonItem: [{ keyword, geo: "", time: DEFAULT_TIMEFRAME }],
+    comparisonItem: [{ keyword, geo: "US", time: DEFAULT_TIMEFRAME }],
     category: 0,
     property: "",
   };
@@ -151,13 +310,23 @@ async function fetchLocalExploreWidgets(keyword) {
 }
 
 async function fetchLocalRelatedTerms(seed) {
-  const widgets = await fetchLocalExploreWidgets(seed);
+  let widgets = [];
+  try {
+    widgets = await fetchLocalExploreWidgets(seed);
+  } catch {
+    return [];
+  }
   const relatedWidget = widgets.find((w) => w?.id === "RELATED_QUERIES") || widgets.find((w) => w?.title === "Related queries");
   if (!relatedWidget?.token || !relatedWidget?.request) return [];
 
-  const txt = await fetchTrendsProxyText(
-    `/trends/api/widgetdata/relatedsearches?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(relatedWidget.request))}&token=${encodeURIComponent(String(relatedWidget.token))}`
-  );
+  let txt = "";
+  try {
+    txt = await fetchTrendsProxyText(
+      `/trends/api/widgetdata/relatedsearches?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(relatedWidget.request))}&token=${encodeURIComponent(String(relatedWidget.token))}`
+    );
+  } catch {
+    return [];
+  }
   const payload = JSON.parse(stripXssi(txt));
 
   const ranked = [];
