@@ -4,14 +4,13 @@ export type TrendItem = {
   score: number | null;
 };
 
-type RankedTerm = {
-  term: string;
-  score: number;
-  isTopSignal?: boolean;
-};
-
-const TZ = "America/Toronto";
-const TREND_ITEMS_PER_PUZZLE = 5;
+/** IANA zone for a single app-wide “game day” (US Eastern, DST-aware). */
+const PUZZLE_TIME_ZONE = "America/New_York";
+export const TREND_ITEMS_PER_PUZZLE = 5;
+/** Minimum puzzle-friendly candidates before random draw (product spec). */
+export const MIN_PUZZLE_FRIENDLY_POOL = 10;
+/** Cap candidate pool size before shuffle (performance). */
+export const MAX_CANDIDATES_FOR_SAMPLE = 40;
 export const FIXED_TIMEFRAME = "now 7-d";
 const DAILY_RSS_GEOS = ["US"];
 const SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
@@ -125,10 +124,17 @@ function toDateIdInTZ(date: Date, timeZone: string): string {
   return `${y}-${m}-${d}`;
 }
 
-export function dateIdInToronto(offsetDays = 0): string {
-  const logical = new Date();
-  logical.setUTCDate(logical.getUTCDate() + offsetDays);
-  return toDateIdInTZ(logical, TZ);
+/**
+ * YYYY-MM-DD in the app’s fixed puzzle clock (`PUZZLE_TIME_ZONE`).
+ * `offsetDays` advances civil calendar days without UTC “midnight drift”.
+ */
+export function puzzleDateId(offsetDays = 0): string {
+  const today = toDateIdInTZ(new Date(), PUZZLE_TIME_ZONE);
+  if (offsetDays === 0) return today;
+  const [y, m, d] = today.split("-").map(Number);
+  const utcNoon = Date.UTC(y, m - 1, d, 12, 0, 0);
+  const shifted = utcNoon + offsetDays * 24 * 60 * 60 * 1000;
+  return toDateIdInTZ(new Date(shifted), PUZZLE_TIME_ZONE);
 }
 
 function hashString(input: string): number {
@@ -160,40 +166,17 @@ function deterministicShuffle<T>(items: T[], seedKey: string): T[] {
   return copy;
 }
 
-function deterministicWeightedSampleTop<T>(
-  items: T[],
-  sampleSize: number,
-  seedKey: string
-): T[] {
-  const rng = mulberry32(hashString(seedKey));
-  const pool = [...items];
-  const out: T[] = [];
-
-  while (pool.length > 0 && out.length < sampleSize) {
-    // Higher-ranked items (earlier in array) get higher probability.
-    let totalWeight = 0;
-    for (let i = 0; i < pool.length; i++) {
-      totalWeight += pool.length - i;
-    }
-
-    let pick = rng() * totalWeight;
-    let chosenIndex = 0;
-    for (let i = 0; i < pool.length; i++) {
-      pick -= pool.length - i;
-      if (pick <= 0) {
-        chosenIndex = i;
-        break;
-      }
-    }
-
-    out.push(pool[chosenIndex]);
-    pool.splice(chosenIndex, 1);
-  }
-
-  return out;
+/** Google Trends host or your reverse proxy origin (no trailing slash). */
+function trendsOrigin(): string {
+  return (process.env.TRENDS_ORIGIN || "https://trends.google.com").replace(/\/$/, "");
 }
 
-function sanitizeTerm(input: string): string | null {
+function trendsUrl(pathWithLeadingSlash: string): string {
+  const p = pathWithLeadingSlash.startsWith("/") ? pathWithLeadingSlash : `/${pathWithLeadingSlash}`;
+  return `${trendsOrigin()}${p}`;
+}
+
+export function sanitizeTerm(input: string): string | null {
   const cleaned = String(input || "")
     .replace(/\s+/g, " ")
     .trim();
@@ -214,19 +197,14 @@ function isLikelyLowSignal(term: string, score: number): boolean {
   const hasDigit = /\d/.test(term);
   const isAcronym = /^[A-Z]{2,6}$/.test(term);
 
-  // Keep numeric and acronym terms if they have reasonable signal.
   if (hasDigit || isAcronym) return score < 30;
-
-  // Low-signal generic single words are filtered more aggressively.
   if (isSingleWord && /^[a-z]+$/.test(normalized) && score < 55) return true;
-
-  // Short and vague terms need stronger evidence.
   if (normalized.length <= 4 && score < 50) return true;
 
   return false;
 }
 
-function isPuzzleFriendlyTerm(term: string): boolean {
+export function isPuzzleFriendlyTerm(term: string): boolean {
   const normalized = String(term || "").trim();
   if (!normalized) return false;
   const words = normalized.split(/\s+/).filter(Boolean);
@@ -303,7 +281,9 @@ async function fetchRssDailyCandidates(): Promise<string[]> {
   const merged: string[] = [];
   for (const geo of DAILY_RSS_GEOS) {
     try {
-      const txt = await fetchText(`https://trends.google.com/trending/rss?geo=${encodeURIComponent(geo)}`);
+      const txt = await fetchText(
+        trendsUrl(`/trending/rss?geo=${encodeURIComponent(geo)}`),
+      );
       merged.push(...parseDailyRssTitles(txt));
     } catch {
       // no-op
@@ -314,13 +294,13 @@ async function fetchRssDailyCandidates(): Promise<string[]> {
 
 async function fetchLegacyDailyCandidates(): Promise<string[]> {
   const urls = [
-    "https://trends.google.com/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
-    "https://trends.google.com/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
+    "/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
+    "/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
   ];
 
-  for (const url of urls) {
+  for (const path of urls) {
     try {
-      const txt = await fetchText(url);
+      const txt = await fetchText(trendsUrl(path));
       const payload = JSON.parse(stripXssi(txt));
       const latestDay = payload?.default?.trendingSearchesDays?.[0];
       const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
@@ -366,14 +346,12 @@ async function fetchExploreWidgetsForComparison(keywords: string[]): Promise<any
     property: "",
   };
 
-  const url = `https://trends.google.com/trends/api/explore?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(req))}`;
+  const url = trendsUrl(
+    `/trends/api/explore?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(req))}`,
+  );
   const txt = await fetchText(url);
   const payload = JSON.parse(stripXssi(txt));
   return Array.isArray(payload?.widgets) ? payload.widgets : [];
-}
-
-async function fetchExploreWidgets(keyword: string): Promise<any[]> {
-  return fetchExploreWidgetsForComparison([keyword]);
 }
 
 async function fetchInterestAveragesForKeywords(keywords: string[]): Promise<Map<string, number>> {
@@ -392,7 +370,9 @@ async function fetchInterestAveragesForKeywords(keywords: string[]): Promise<Map
     widgets.find((w) => String(w?.title || "").toLowerCase().includes("interest over time"));
   if (!timeWidget?.token || !timeWidget?.request) return out;
 
-  const url = `https://trends.google.com/trends/api/widgetdata/multiline?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(timeWidget.request))}&token=${encodeURIComponent(String(timeWidget.token))}`;
+  const url = trendsUrl(
+    `/trends/api/widgetdata/multiline?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(timeWidget.request))}&token=${encodeURIComponent(String(timeWidget.token))}`,
+  );
   let txt = "";
   try {
     txt = await fetchText(url);
@@ -434,8 +414,8 @@ async function rankTermsByGoogleInterest(terms: string[], seedKey: string): Prom
       terms
         .map((term) => sanitizeTerm(term))
         .filter((x): x is string => Boolean(x))
-        .map((x) => x.toLowerCase())
-    )
+        .map((x) => x.toLowerCase()),
+    ),
   );
 
   const canonical = new Map<string, string>();
@@ -495,23 +475,20 @@ async function rankTermsByGoogleInterest(terms: string[], seedKey: string): Prom
   return ranked;
 }
 
-async function rankTermsBySerpApiInterest(
-  terms: string[],
-  apiKey: string,
-): Promise<Map<string, number>> {
+async function rankTermsBySerpApiInterest(terms: string[], apiKey: string): Promise<Map<string, number>> {
   const ranked = new Map<string, number>();
   const normalizedTerms = Array.from(
     new Set(
       terms
         .map((x) => sanitizeTerm(x))
-        .filter((x): x is string => Boolean(x))
-    )
+        .filter((x): x is string => Boolean(x)),
+    ),
   );
 
   if (normalizedTerms.length === 0) return ranked;
 
   const url = `${SERPAPI_ENDPOINT}?engine=${encodeURIComponent(SERPAPI_ENGINE)}&data_type=TIMESERIES&q=${encodeURIComponent(
-    normalizedTerms.join(",")
+    normalizedTerms.join(","),
   )}&date=${encodeURIComponent(FIXED_TIMEFRAME)}&geo=${encodeURIComponent(SERPAPI_REGION)}&api_key=${encodeURIComponent(apiKey)}`;
 
   let payload: any;
@@ -562,96 +539,87 @@ async function rankTermsBySerpApiInterest(
   return ranked;
 }
 
-async function rankTermsByConfiguredProvider(terms: string[], seedKey: string): Promise<Map<string, number>> {
-  const provider = String(process.env.TREND_RANK_PROVIDER || "google").trim().toLowerCase();
-  const serpApiKey = String(process.env.SERPAPI_KEY || "").trim();
-
-  if (provider === "serpapi" && serpApiKey) {
-    const serpScores = await rankTermsBySerpApiInterest(terms, serpApiKey);
-    if (serpScores.size > 0) return serpScores;
-    return rankTermsByGoogleInterest(terms, seedKey);
+function scoreMapGetCaseInsensitive(map: Map<string, number>, term: string): number | undefined {
+  const c = sanitizeTerm(term);
+  if (!c) return undefined;
+  if (map.has(c)) return map.get(c);
+  const lower = c.toLowerCase();
+  for (const [k, v] of map) {
+    if (k.toLowerCase() === lower) return v;
   }
-
-  if (provider === "hybrid" && serpApiKey) {
-    const serpScores = await rankTermsBySerpApiInterest(terms, serpApiKey);
-    if (serpScores.size > 0) return serpScores;
-    return rankTermsByGoogleInterest(terms, seedKey);
-  }
-
-  const googleScores = await rankTermsByGoogleInterest(terms, seedKey);
-  if (googleScores.size > 0) return googleScores;
-
-  if (serpApiKey) {
-    const serpScores = await rankTermsBySerpApiInterest(terms, serpApiKey);
-    if (serpScores.size > 0) return serpScores;
-  }
-
-  return googleScores;
+  return undefined;
 }
 
-async function fetchRelatedTerms(seed: string): Promise<RankedTerm[]> {
-  let widgets: any[] = [];
-  try {
-    widgets = await fetchExploreWidgets(seed);
-  } catch {
-    return [];
+/**
+ * Ranks exactly five terms using one transport: direct/proxy Google scrape, or SerpAPI google_trends (vendor).
+ * Throws if any term lacks a finite score (no silent placeholder ordering).
+ */
+async function rankFiveTermsStrict(terms: string[]): Promise<Map<string, number>> {
+  const normalized = terms.map((t) => sanitizeTerm(t)).filter((x): x is string => Boolean(x));
+  if (normalized.length !== TREND_ITEMS_PER_PUZZLE) {
+    throw new Error(`Expected ${TREND_ITEMS_PER_PUZZLE} sanitized terms for ranking, got ${normalized.length}`);
   }
-  const relatedWidget = widgets.find((w) => w?.id === "RELATED_QUERIES") || widgets.find((w) => w?.title === "Related queries");
-  if (!relatedWidget?.token || !relatedWidget?.request) return [];
 
-  const url = `https://trends.google.com/trends/api/widgetdata/relatedsearches?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(relatedWidget.request))}&token=${encodeURIComponent(String(relatedWidget.token))}`;
-  let txt = "";
-  try {
-    txt = await fetchText(url);
-  } catch {
-    return [];
-  }
-  const payload = JSON.parse(stripXssi(txt));
+  const mode = String(process.env.TRENDS_FETCH_MODE || "direct").trim().toLowerCase();
+  let raw: Map<string, number>;
 
-  const ranked: RankedTerm[] = [];
-  const rankedLists = payload?.default?.rankedList;
-  if (!Array.isArray(rankedLists)) return ranked;
-
-  for (const group of rankedLists) {
-    const isTop = String(group?.rankedKeywordType || "").toLowerCase() === "top";
-    const items = group?.rankedKeyword;
-    if (!Array.isArray(items)) continue;
-    for (const item of items) {
-      const raw = item?.query;
-      const clean = sanitizeTerm(raw);
-      if (!clean) continue;
-
-      let score = 0;
-      if (Array.isArray(item?.value) && typeof item.value[0] === "number") {
-        score = Number(item.value[0]);
-      }
-      if (!Number.isFinite(score) || score < 0) score = 0;
-
-      if (String(item?.value?.[0] || "").toLowerCase() === "breakout") {
-        score = 100;
-      }
-
-      ranked.push({ term: clean, score, isTopSignal: isTop });
+  if (mode === "vendor") {
+    const key = String(process.env.SERPAPI_KEY || "").trim();
+    if (!key) {
+      throw new Error("TRENDS_FETCH_MODE=vendor requires SERPAPI_KEY");
     }
+    raw = await rankTermsBySerpApiInterest(normalized, key);
+  } else {
+    raw = await rankTermsByGoogleInterest(normalized, "strict-five");
   }
 
-  return ranked;
+  const out = new Map<string, number>();
+  for (const t of normalized) {
+    const s = scoreMapGetCaseInsensitive(raw, t);
+    if (typeof s !== "number" || !Number.isFinite(s)) {
+      throw new Error(
+        `Incomplete Google Trends interest data for term "${t}" (mode=${mode}). Check TRENDS_ORIGIN proxy or switch TRENDS_FETCH_MODE=vendor with SERPAPI_KEY.`,
+      );
+    }
+    out.set(t, s);
+  }
+  return out;
 }
 
-function mergeRankedTerms(items: RankedTerm[]): RankedTerm[] {
-  const best = new Map<string, RankedTerm>();
-  for (const item of items) {
-    const key = item.term.toLowerCase();
-    const prev = best.get(key);
-    if (!prev || item.score > prev.score) {
-      best.set(key, item);
-    }
+/**
+ * Uniform random five (deterministic by seedKey): shuffle capped pool, take first five.
+ * If forcedSeed is set and puzzle-friendly, it is always included and the other four are drawn from the rest.
+ */
+export function deterministicPickFiveFromPool(
+  puzzleFriendly: string[],
+  seedKey: string,
+  forcedSeed?: string,
+): string[] {
+  if (puzzleFriendly.length < MIN_PUZZLE_FRIENDLY_POOL) {
+    throw new Error(
+      `Need at least ${MIN_PUZZLE_FRIENDLY_POOL} puzzle-friendly candidates, got ${puzzleFriendly.length}`,
+    );
   }
 
-  return Array.from(best.values())
-    .filter((x) => !isLikelyLowSignal(x.term, x.score))
-    .filter((x) => isPuzzleFriendlyTerm(x.term))
-    .sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
+  let pool = puzzleFriendly.slice(0, MAX_CANDIDATES_FOR_SAMPLE);
+  const forcedRaw = forcedSeed?.trim() ? sanitizeTerm(forcedSeed.trim()) : null;
+
+  if (forcedRaw) {
+    if (!isPuzzleFriendlyTerm(forcedRaw)) {
+      throw new Error("forcedSeed is not a puzzle-friendly term");
+    }
+    const forced = forcedRaw;
+    const withoutForced = pool.filter((t) => t.toLowerCase() !== forced.toLowerCase());
+    const need = TREND_ITEMS_PER_PUZZLE - 1;
+    if (withoutForced.length < need) {
+      throw new Error("Not enough candidates to combine with forcedSeed");
+    }
+    const shuffledRest = deterministicShuffle(withoutForced, `${seedKey}:forced-fill`);
+    return [forced, ...shuffledRest.slice(0, need)];
+  }
+
+  const shuffled = deterministicShuffle(pool, `${seedKey}:pick5`);
+  return shuffled.slice(0, TREND_ITEMS_PER_PUZZLE);
 }
 
 export async function generateTrendPuzzle(options: {
@@ -659,54 +627,34 @@ export async function generateTrendPuzzle(options: {
   sourceDate?: string;
   forcedSeed?: string;
 }): Promise<{ topicSeed: string; sourceDate: string; timeframe: string; items: TrendItem[] }> {
-  const sourceDate = options.sourceDate || dateIdInToronto(0);
+  const sourceDate = options.sourceDate || puzzleDateId(0);
   const candidates = await fetchDailyCandidates();
   const puzzleFriendlyCandidates = candidates.filter((x) => isPuzzleFriendlyTerm(x));
-  if (puzzleFriendlyCandidates.length < TREND_ITEMS_PER_PUZZLE) {
-    throw new Error("Insufficient daily trend candidates.");
-  }
 
-  // Randomness from only the current top trend window:
-  // keeps puzzles varied while staying anchored to what's trending now.
-  const topWindow = puzzleFriendlyCandidates.slice(0, 16);
-  const pickedTerms = deterministicWeightedSampleTop(
-    topWindow,
-    TREND_ITEMS_PER_PUZZLE,
-    `${options.puzzleId}:pick`
-  );
-  if (pickedTerms.length < TREND_ITEMS_PER_PUZZLE) {
-    throw new Error("Unable to build 5 unique trend items.");
-  }
-
-  const relevancePool: RankedTerm[] = pickedTerms.map((term, idx) => ({
-    term,
-    score: Math.max(1, 100 - idx),
-    isTopSignal: true,
-  }));
-
-  const googleScores = await rankTermsByConfiguredProvider(
-    relevancePool.map((x) => x.term),
-    options.puzzleId
+  const pickedTerms = deterministicPickFiveFromPool(
+    puzzleFriendlyCandidates,
+    options.puzzleId,
+    options.forcedSeed,
   );
 
-  const scored = relevancePool.map((entry) => {
-    const googleScore = googleScores.get(entry.term);
-    return {
-      ...entry,
-      score: Number.isFinite(googleScore) ? (googleScore as number) : entry.score,
-    };
+  const scores = await rankFiveTermsStrict(pickedTerms);
+  const sorted = [...pickedTerms].sort((a, b) => {
+    const sa = scores.get(a) ?? 0;
+    const sb = scores.get(b) ?? 0;
+    if (sb !== sa) return sb - sa;
+    return a.localeCompare(b);
   });
 
-  const sorted = scored.sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
-
-  const items: TrendItem[] = sorted.map((entry, idx) => ({
-    term: entry.term,
+  const items: TrendItem[] = sorted.map((term, idx) => ({
+    term,
     rank: idx + 1,
-    score: Number.isFinite(entry.score) ? entry.score : null,
+    score: scores.get(term) ?? null,
   }));
 
+  const topicSeed = options.forcedSeed?.trim() ? String(sanitizeTerm(options.forcedSeed.trim()) || "") : "";
+
   return {
-    topicSeed: "",
+    topicSeed,
     sourceDate,
     timeframe: FIXED_TIMEFRAME,
     items,

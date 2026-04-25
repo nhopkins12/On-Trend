@@ -1,9 +1,13 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, Suspense, lazy } from "react";
 import { generateClient } from "aws-amplify/data";
-import { Authenticator } from "@aws-amplify/ui-react";
 import "@aws-amplify/ui-react/styles.css";
 import { fetchUserAttributes, getCurrentUser } from "aws-amplify/auth";
+import { Hub } from "aws-amplify/utils";
 import PillHighlight from "./PillHighlight";
+
+const LazyAuthenticator = lazy(() =>
+  import("@aws-amplify/ui-react").then((m) => ({ default: m.Authenticator })),
+);
 
 function hashString(input) {
   let h = 2166136261;
@@ -34,127 +38,6 @@ function deterministicShuffle(items, seedKey) {
   return copy;
 }
 
-function stripXssi(text) {
-  return text.replace(/^\)\]\}',?\n/, "");
-}
-
-function decodeXmlEntities(input) {
-  return String(input || "")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
-
-function sanitizeTrendTerm(input) {
-  const cleaned = String(input || "").replace(/\s+/g, " ").trim();
-  if (cleaned.length < 2 || cleaned.length > 80) return null;
-  if (/^[^A-Za-z0-9]+$/.test(cleaned)) return null;
-  if (/[^\w\s'&+\-/.#]/.test(cleaned)) return null;
-  return cleaned;
-}
-
-const LOW_SIGNAL_TERMS = new Set([
-  "becoming",
-  "mannequin challenge",
-  "today",
-  "tomorrow",
-  "yesterday",
-  "thing",
-  "things",
-  "story",
-  "stories",
-  "update",
-]);
-const NON_NOUN_TOKENS = new Set([
-  "is",
-  "are",
-  "was",
-  "were",
-  "be",
-  "being",
-  "been",
-  "am",
-  "do",
-  "does",
-  "did",
-  "doing",
-  "have",
-  "has",
-  "had",
-  "can",
-  "could",
-  "should",
-  "would",
-  "may",
-  "might",
-  "must",
-  "will",
-  "shall",
-  "go",
-  "goes",
-  "went",
-  "going",
-  "get",
-  "gets",
-  "got",
-  "make",
-  "makes",
-  "made",
-  "say",
-  "says",
-  "said",
-  "watch",
-  "stream",
-  "live",
-  "see",
-  "know",
-  "find",
-  "buy",
-  "sell",
-  "trade",
-  "play",
-  "playing",
-  "played",
-  "win",
-  "won",
-  "lose",
-  "lost",
-]);
-
-function isLikelyLowSignal(term, score) {
-  const normalized = String(term || "").toLowerCase();
-  if (LOW_SIGNAL_TERMS.has(normalized) && score < 90) return true;
-
-  const words = normalized.split(/\s+/).filter(Boolean);
-  const hasDigit = /\d/.test(term);
-  const isAcronym = /^[A-Z]{2,6}$/.test(term);
-
-  if (hasDigit || isAcronym) return score < 30;
-  if (words.length === 1 && /^[a-z]+$/.test(normalized) && score < 55) return true;
-  if (normalized.length <= 4 && score < 50) return true;
-
-  return false;
-}
-
-function isPuzzleFriendlyTerm(term) {
-  const normalized = String(term || "").trim();
-  if (!normalized) return false;
-  const words = normalized.split(/\s+/).filter(Boolean);
-  if (words.length > 5) return false;
-  if (normalized.length > 48) return false;
-  if (/\b(update|live|radar|video|stream|breaking)\b/i.test(normalized)) return false;
-  const tokens = normalized
-    .toLowerCase()
-    .split(/[^a-z0-9']+/)
-    .filter(Boolean);
-  if (!tokens.length) return false;
-  const nonNounCount = tokens.filter((t) => NON_NOUN_TOKENS.has(t)).length;
-  if (nonNounCount > 0) return false;
-  return true;
-}
-
 function parseItems(rawItems) {
   const parsed = Array.isArray(rawItems)
     ? rawItems
@@ -174,10 +57,13 @@ function parseItems(rawItems) {
     : [];
 }
 
-function todayIdToronto() {
+/** Must match the API’s `puzzleDateId(0)` (same IANA as backend `PUZZLE_TIME_ZONE`). */
+const PUZZLE_TIME_ZONE = "America/New_York";
+
+function todayPuzzleDateId() {
   const now = new Date();
   const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Toronto",
+    timeZone: PUZZLE_TIME_ZONE,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -190,268 +76,7 @@ function todayIdToronto() {
 }
 
 const TOTAL_ITEMS = 5;
-const LOCAL_USER_ID = "local-user";
 const DEFAULT_TIMEFRAME = "now 7-d";
-
-
-async function fetchTrendsProxyText(path) {
-  const maxAttempts = 3;
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await fetch(`/trends-proxy${path}`, {
-        headers: {
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      });
-
-      if (response.ok) {
-        return response.text();
-      }
-
-      const retryable = response.status === 429 || response.status >= 500;
-      if (retryable && attempt < maxAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-        continue;
-      }
-
-      throw new Error(`Proxy request failed (${response.status})`);
-    } catch (err) {
-      lastErr = err;
-      if (attempt < maxAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
-        continue;
-      }
-    }
-  }
-
-  throw lastErr || new Error("Proxy request failed");
-}
-
-function parseRssCandidates(xmlText) {
-  const out = [];
-  const blocks = String(xmlText || "").match(/<item>[\s\S]*?<\/item>/g) || [];
-
-  for (const block of blocks) {
-    const m = block.match(/<title>([\s\S]*?)<\/title>/i);
-    if (!m?.[1]) continue;
-    const clean = sanitizeTrendTerm(decodeXmlEntities(m[1]));
-    if (clean) {
-      out.push(clean);
-    }
-  }
-
-  return Array.from(new Set(out));
-}
-
-async function fetchLocalDailyCandidatesFromLegacyApi() {
-  const paths = [
-    "/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
-    "/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
-  ];
-
-  for (const path of paths) {
-    try {
-      const txt = await fetchTrendsProxyText(path);
-      const payload = JSON.parse(stripXssi(txt));
-      const latestDay = payload?.default?.trendingSearchesDays?.[0];
-      const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
-      const out = [];
-      for (const entry of list) {
-        const clean = sanitizeTrendTerm(entry?.title?.query);
-        if (clean) out.push(clean);
-      }
-      const unique = Array.from(new Set(out));
-      if (unique.length) return unique;
-    } catch {
-      // try next variant
-    }
-  }
-
-  return [];
-}
-
-async function fetchLocalDailyCandidatesFromRss() {
-  const geos = ["US"];
-  const merged = [];
-
-  for (const geo of geos) {
-    try {
-      const txt = await fetchTrendsProxyText(`/trending/rss?geo=${encodeURIComponent(geo)}`);
-      merged.push(...parseRssCandidates(txt));
-    } catch {
-      // no-op
-    }
-  }
-
-  return Array.from(new Set(merged));
-}
-
-async function fetchLocalDailyCandidates() {
-  const legacy = await fetchLocalDailyCandidatesFromLegacyApi();
-  if (legacy.length) return legacy.filter((x) => isPuzzleFriendlyTerm(x));
-
-  const rss = await fetchLocalDailyCandidatesFromRss();
-  if (rss.length) return rss.filter((x) => isPuzzleFriendlyTerm(x));
-
-  throw new Error("No local candidates available from Google Trends");
-}
-
-async function fetchLocalExploreWidgets(keyword) {
-  const req = {
-    comparisonItem: [{ keyword, geo: "US", time: DEFAULT_TIMEFRAME }],
-    category: 0,
-    property: "",
-  };
-  const txt = await fetchTrendsProxyText(`/trends/api/explore?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(req))}`);
-  const payload = JSON.parse(stripXssi(txt));
-  return Array.isArray(payload?.widgets) ? payload.widgets : [];
-}
-
-async function fetchLocalRelatedTerms(seed) {
-  let widgets = [];
-  try {
-    widgets = await fetchLocalExploreWidgets(seed);
-  } catch {
-    return [];
-  }
-  const relatedWidget = widgets.find((w) => w?.id === "RELATED_QUERIES") || widgets.find((w) => w?.title === "Related queries");
-  if (!relatedWidget?.token || !relatedWidget?.request) return [];
-
-  let txt = "";
-  try {
-    txt = await fetchTrendsProxyText(
-      `/trends/api/widgetdata/relatedsearches?hl=en-US&tz=0&req=${encodeURIComponent(JSON.stringify(relatedWidget.request))}&token=${encodeURIComponent(String(relatedWidget.token))}`
-    );
-  } catch {
-    return [];
-  }
-  const payload = JSON.parse(stripXssi(txt));
-
-  const ranked = [];
-  const rankedLists = payload?.default?.rankedList;
-  if (!Array.isArray(rankedLists)) return ranked;
-
-  for (const group of rankedLists) {
-    const items = Array.isArray(group?.rankedKeyword) ? group.rankedKeyword : [];
-    for (const item of items) {
-      const clean = sanitizeTrendTerm(item?.query);
-      if (!clean) continue;
-
-      let score = 0;
-      if (Array.isArray(item?.value) && typeof item.value[0] === "number") {
-        score = Number(item.value[0]);
-      }
-      if (!Number.isFinite(score) || score < 0) score = 0;
-      if (String(item?.value?.[0] || "").toLowerCase() === "breakout") score = 100;
-
-      if (isLikelyLowSignal(clean, score)) continue;
-      ranked.push({ term: clean, score });
-    }
-  }
-
-  return ranked;
-}
-
-function mergeRankedTerms(items) {
-  const best = new Map();
-  for (const item of items) {
-    const key = item.term.toLowerCase();
-    const prev = best.get(key);
-    if (!prev || item.score > prev.score) best.set(key, item);
-  }
-  return Array.from(best.values()).sort((a, b) => b.score - a.score || a.term.localeCompare(b.term));
-}
-
-async function buildLocalPuzzleFromAlgorithm(puzzleId) {
-  const candidates = await fetchLocalDailyCandidates();
-  if (candidates.length < TOTAL_ITEMS) {
-    throw new Error("Not enough daily candidates in local generator");
-  }
-
-  const seedCandidates = deterministicShuffle(candidates.slice(0, 32), `${puzzleId}:local-seed`);
-  let selectedSeed = seedCandidates[0];
-  let related = [];
-
-  for (const seed of seedCandidates) {
-    const rel = await fetchLocalRelatedTerms(seed);
-    if (rel.filter((x) => x.score >= 45).length >= 8) {
-      selectedSeed = seed;
-      related = rel;
-      break;
-    }
-  }
-
-  const clusterPool = mergeRankedTerms(related);
-  if (!clusterPool.find((x) => x.term.toLowerCase() === selectedSeed.toLowerCase())) {
-    const top = clusterPool[0]?.score ?? 100;
-    clusterPool.unshift({ term: selectedSeed, score: top + 1 });
-  }
-
-  const fallbackPool = mergeRankedTerms(
-    candidates.map((term, index) => ({ term, score: Math.max(1, 100 - index) })).filter((x) => !isLikelyLowSignal(x.term, x.score))
-  );
-
-  const selected = [];
-  const seen = new Set();
-
-  for (const item of clusterPool) {
-    const key = item.term.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    selected.push(item);
-    if (selected.length === TOTAL_ITEMS) break;
-  }
-
-  if (selected.length < TOTAL_ITEMS) {
-    for (const item of fallbackPool) {
-      const key = item.term.toLowerCase();
-      if (seen.has(key)) continue;
-      seen.add(key);
-      selected.push(item);
-      if (selected.length === TOTAL_ITEMS) break;
-    }
-  }
-
-  if (selected.length < TOTAL_ITEMS) {
-    throw new Error("Unable to build local puzzle from trends algorithm");
-  }
-
-  const ranked = selected
-    .slice(0, TOTAL_ITEMS)
-    .sort((a, b) => b.score - a.score || a.term.localeCompare(b.term))
-    .map((item, i) => ({ term: item.term, rank: i + 1, score: item.score }));
-
-  return {
-    id: puzzleId,
-    topicSeed: `${selectedSeed} (Local Algorithm)`,
-    timeframe: DEFAULT_TIMEFRAME,
-    items: ranked,
-  };
-}
-
-function localLeaderboardKey(puzzleId) {
-  return `ontrends:local:leaderboard:${puzzleId}`;
-}
-
-function readLocalLeaderboard(puzzleId) {
-  try {
-    const raw = localStorage.getItem(localLeaderboardKey(puzzleId));
-    const parsed = raw ? JSON.parse(raw) : [];
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeLocalLeaderboard(puzzleId, rows) {
-  try {
-    localStorage.setItem(localLeaderboardKey(puzzleId), JSON.stringify(rows));
-  } catch {
-    // no-op
-  }
-}
 
 function sortEntries(entries) {
   return [...entries].sort((a, b) => {
@@ -468,9 +93,11 @@ function sortEntries(entries) {
 }
 
 export default function OnTrendsGame() {
-  const forceLocal = String(import.meta.env.VITE_LOCAL_ONLY || "") === "1";
+  /** loading | ready | pending | failed | missing */
+  const [puzzleCloudState, setPuzzleCloudState] = useState("loading");
+  const [puzzleError, setPuzzleError] = useState("");
+  const [puzzleRetryTick, setPuzzleRetryTick] = useState(0);
 
-  const [puzzleLoading, setPuzzleLoading] = useState(true);
   const [puzzleId, setPuzzleId] = useState("");
   const [topicSeed, setTopicSeed] = useState("");
   const [timeframe, setTimeframe] = useState(DEFAULT_TIMEFRAME);
@@ -486,13 +113,14 @@ export default function OnTrendsGame() {
 
   const [isComplete, setIsComplete] = useState(false);
   const [leaderboard, setLeaderboard] = useState([]);
+  const [leaderboardLoading, setLeaderboardLoading] = useState(false);
+  const [leaderboardError, setLeaderboardError] = useState("");
   const [isAuthed, setIsAuthed] = useState(false);
   const [myUserId, setMyUserId] = useState("");
   const [authOpen, setAuthOpen] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [hasSavedScore, setHasSavedScore] = useState(false);
   const [isSavingScore, setIsSavingScore] = useState(false);
-  const [useLocalMode, setUseLocalMode] = useState(forceLocal);
 
   const listContainerRef = useRef(null);
   const itemRefs = useRef([]);
@@ -535,130 +163,121 @@ export default function OnTrendsGame() {
     saveTriggeredRef.current = false;
   }, []);
 
-  const loadLocalPuzzle = useCallback(async () => {
-    const pid = todayIdToronto();
-    setUseLocalMode(true);
-    setIsAuthed(true);
-    setMyUserId(LOCAL_USER_ID);
-    const localPuzzle = await buildLocalPuzzleFromAlgorithm(pid);
+  const loadTodayPuzzle = useCallback(async () => {
+    setPuzzleCloudState("loading");
+    setPuzzleError("");
+    const todayId = todayPuzzleDateId();
 
-    setPuzzleId(localPuzzle.id);
-    setTopicSeed(localPuzzle.topicSeed);
-    setTimeframe(localPuzzle.timeframe);
-    setOrderedItems(localPuzzle.items);
-    initializeGame(localPuzzle.items, localPuzzle.id);
+    try {
+      const client = generateClient();
+      const { data, errors } = await client.models.DailyTrendPuzzle.get({ id: todayId });
+
+      if (errors?.length) {
+        setPuzzleError(errors.map((e) => e.message).join("; ") || "Failed to load puzzle");
+        setPuzzleCloudState("failed");
+        return;
+      }
+
+      if (!data) {
+        setPuzzleCloudState("missing");
+        setPuzzleError(
+          "No puzzle row for today yet. After deployment, the scheduled job writes the next day’s puzzle; today’s row may still be empty.",
+        );
+        return;
+      }
+
+      const compute = String(data.computeState || "").toLowerCase();
+      if (compute === "pending") {
+        setPuzzleCloudState("pending");
+        setPuzzleId(String(data.id || ""));
+        return;
+      }
+
+      if (compute === "failed") {
+        setPuzzleCloudState("failed");
+        setPuzzleId(String(data.id || ""));
+        setPuzzleError("The backend could not rank today’s trends (strict scoring). Check Lambda env: TRENDS_FETCH_MODE, TRENDS_ORIGIN, or SERPAPI_KEY for vendor mode.");
+        return;
+      }
+
+      if (compute !== "ready") {
+        setPuzzleCloudState("failed");
+        setPuzzleError(`Unexpected compute state: ${compute || "unknown"}`);
+        return;
+      }
+
+      const parsedItems = parseItems(data.items);
+      if (parsedItems.length !== TOTAL_ITEMS) {
+        setPuzzleCloudState("failed");
+        setPuzzleError(`Puzzle is incomplete (${parsedItems.length}/${TOTAL_ITEMS} ranked items).`);
+        return;
+      }
+
+      setPuzzleCloudState("ready");
+      setPuzzleId(String(data.id));
+      setTopicSeed(String(data.topicSeed || ""));
+      setTimeframe(String(data.timeframe || DEFAULT_TIMEFRAME));
+      setOrderedItems(parsedItems);
+      initializeGame(parsedItems, String(data.id));
+    } catch (err) {
+      console.warn("DailyTrendPuzzle.get failed", err);
+      setPuzzleError(err?.message || "Network or configuration error loading the puzzle.");
+      setPuzzleCloudState("failed");
+    }
   }, [initializeGame]);
 
-  const fetchLeaderboard = useCallback(
-    async (pid) => {
-      if (!pid) return;
+  useEffect(() => {
+    loadTodayPuzzle();
+  }, [loadTodayPuzzle, puzzleRetryTick]);
 
-      if (useLocalMode) {
-        const sorted = sortEntries(readLocalLeaderboard(pid));
-        setLeaderboard(
-          sorted.map((x) => ({
-            name: x?.name || "Local Player",
-            userId: x?.userId || LOCAL_USER_ID,
-            correctCount: x?.correctCount ?? 0,
-            mistakes: x?.mistakes ?? TOTAL_ITEMS,
-          }))
-        );
+  const fetchLeaderboard = useCallback(async (pid) => {
+    if (!pid || puzzleCloudState !== "ready") return;
+    setLeaderboardLoading(true);
+    setLeaderboardError("");
+    try {
+      const client = generateClient();
+      const { data, errors } = await client.models.TrendScore.list();
+      if (errors?.length) {
+        setLeaderboardError(errors.map((e) => e.message).join("; "));
+        setLeaderboard([]);
         return;
       }
 
-      try {
-        const client = generateClient();
-        const { data, errors } = await client.models.TrendScore.list();
-        if (errors?.length) console.warn("TrendScore list errors", errors);
-
-        const entries = (Array.isArray(data) ? data : []).filter((x) => x?.puzzleId === pid);
-        const byUser = new Map();
-        for (const entry of entries) {
-          const key = entry?.userId || `name:${entry?.name || ""}`;
-          const prev = byUser.get(key);
-          if (!prev || (entry?.mistakes ?? 99) < (prev?.mistakes ?? 99)) {
-            byUser.set(key, entry);
-          }
+      const entries = (Array.isArray(data) ? data : []).filter((x) => x?.puzzleId === pid);
+      const byUser = new Map();
+      for (const entry of entries) {
+        const key = entry?.userId || `name:${entry?.name || ""}`;
+        const prev = byUser.get(key);
+        if (!prev || (entry?.mistakes ?? 99) < (prev?.mistakes ?? 99)) {
+          byUser.set(key, entry);
         }
-
-        const sorted = sortEntries(Array.from(byUser.values()));
-        setLeaderboard(
-          sorted.map((x) => ({
-            name: x?.name || "Player",
-            userId: x?.userId || "",
-            correctCount: x?.correctCount ?? 0,
-            mistakes: x?.mistakes ?? TOTAL_ITEMS,
-          }))
-        );
-      } catch (err) {
-        console.warn("Failed leaderboard fetch. Switching to local mode.", err);
-        await loadLocalPuzzle();
-      }
-    },
-    [loadLocalPuzzle, useLocalMode]
-  );
-
-  useEffect(() => {
-    const loadPuzzle = async () => {
-      if (forceLocal) {
-        await loadLocalPuzzle();
-        setPuzzleLoading(false);
-        return;
       }
 
-      try {
-        const client = generateClient();
-        const { data } = await client.models.DailyTrendPuzzle.list();
-        const items = Array.isArray(data) ? data : [];
-        const ready = items.filter((x) => x?.computeState === "ready");
-        const todayId = todayIdToronto();
-
-        const activeToday = ready.find((x) => x?.id === todayId && x?.status === "active");
-        const activeLatest = ready
-          .filter((x) => x?.status === "active")
-          .sort((a, b) => String(b.id || "").localeCompare(String(a.id || "")))[0];
-        const fallback = ready.sort((a, b) => String(b.id || "").localeCompare(String(a.id || "")))[0];
-
-        const chosen = activeToday || activeLatest || fallback;
-
-        if (!chosen?.id) {
-          await loadLocalPuzzle();
-          return;
-        }
-
-        const parsedItems = parseItems(chosen.items);
-        if (parsedItems.length !== TOTAL_ITEMS) {
-          await loadLocalPuzzle();
-          return;
-        }
-
-        setPuzzleId(chosen.id);
-        setTopicSeed(String(chosen.topicSeed || ""));
-        setTimeframe(String(chosen.timeframe || DEFAULT_TIMEFRAME));
-        setOrderedItems(parsedItems);
-        initializeGame(parsedItems, chosen.id);
-      } catch (err) {
-        console.warn("Failed to load trend puzzle. Switching to local mode.", err);
-        await loadLocalPuzzle();
-      } finally {
-        setPuzzleLoading(false);
-      }
-    };
-
-    loadPuzzle();
-  }, [forceLocal, initializeGame, loadLocalPuzzle]);
-
-  useEffect(() => {
-    fetchLeaderboard(puzzleId);
-  }, [puzzleId, fetchLeaderboard]);
-
-  useEffect(() => {
-    if (useLocalMode) {
-      setIsAuthed(true);
-      setMyUserId(LOCAL_USER_ID);
-      return;
+      const sorted = sortEntries(Array.from(byUser.values()));
+      setLeaderboard(
+        sorted.map((x) => ({
+          name: x?.name || "Player",
+          userId: x?.userId || "",
+          correctCount: x?.correctCount ?? 0,
+          mistakes: x?.mistakes ?? TOTAL_ITEMS,
+        })),
+      );
+    } catch (err) {
+      console.warn("Leaderboard fetch failed", err);
+      setLeaderboardError("Could not load leaderboard.");
+      setLeaderboard([]);
+    } finally {
+      setLeaderboardLoading(false);
     }
+  }, [puzzleCloudState]);
 
+  useEffect(() => {
+    if (puzzleCloudState === "ready" && puzzleId) {
+      fetchLeaderboard(puzzleId);
+    }
+  }, [puzzleId, puzzleCloudState, fetchLeaderboard]);
+
+  useEffect(() => {
     (async () => {
       try {
         const user = await getCurrentUser();
@@ -671,61 +290,88 @@ export default function OnTrendsGame() {
         setIsAuthed(false);
       }
     })();
-  }, [useLocalMode]);
+  }, []);
+
+  useEffect(() => {
+    if (!authOpen) return undefined;
+    const remove = Hub.listen("auth", ({ payload }) => {
+      if (payload.event === "signedIn") {
+        (async () => {
+          try {
+            const user = await getCurrentUser();
+            const attrs = await fetchUserAttributes();
+            const uid = user?.userId || attrs?.sub || user?.username || "";
+            setMyUserId(uid);
+            setIsAuthed(Boolean(uid));
+            setAuthOpen(false);
+          } catch {
+            // no-op
+          }
+        })();
+      }
+    });
+    return () => remove();
+  }, [authOpen]);
 
   const pendingTerm = pendingQueue[0] || "";
   const progress = Math.min(TOTAL_ITEMS, revealedItems.length);
 
-  const placePendingAtIndex = useCallback((chosenIndex) => {
-    if (!pendingTerm || isComplete) return;
+  const placePendingAtIndex = useCallback(
+    (chosenIndex) => {
+      if (!pendingTerm || isComplete) return;
 
-    const pendingRank = rankByTerm.get(pendingTerm);
-    const correctIndex = revealedItems.filter((term) => (rankByTerm.get(term) ?? 999) < pendingRank).length;
-    const wasCorrect = chosenIndex === correctIndex;
+      const pendingRank = rankByTerm.get(pendingTerm);
+      const correctIndex = revealedItems.filter((term) => (rankByTerm.get(term) ?? 999) < pendingRank).length;
+      const wasCorrect = chosenIndex === correctIndex;
 
-    const nextRevealed = [...revealedItems];
-    nextRevealed.splice(correctIndex, 0, pendingTerm);
+      const nextRevealed = [...revealedItems];
+      nextRevealed.splice(correctIndex, 0, pendingTerm);
 
-    const nextQueue = pendingQueue.slice(1);
-    const nextCorrect = correctCount + (wasCorrect ? 1 : 0);
+      const nextQueue = pendingQueue.slice(1);
+      const nextCorrect = correctCount + (wasCorrect ? 1 : 0);
 
-    const stepLog = {
-      term: pendingTerm,
-      chosenIndex,
-      correctIndex,
-      wasCorrect,
-      autoPlaced: false,
-      interaction: "drag_drop",
-    };
+      const stepLog = {
+        term: pendingTerm,
+        chosenIndex,
+        correctIndex,
+        wasCorrect,
+        autoPlaced: false,
+        interaction: "drag_drop",
+      };
 
-    setRevealedItems(nextRevealed);
-    setPendingQueue(nextQueue);
-    setCorrectCount(nextCorrect);
-    setPlacementLog((prev) => [...prev, stepLog]);
-    setLastResult({
-      term: pendingTerm,
-      wasCorrect,
-      chosenIndex,
-      correctIndex,
-    });
-    setDragOverIndex(null);
-    setDraggingPending(false);
+      setRevealedItems(nextRevealed);
+      setPendingQueue(nextQueue);
+      setCorrectCount(nextCorrect);
+      setPlacementLog((prev) => [...prev, stepLog]);
+      setLastResult({
+        term: pendingTerm,
+        wasCorrect,
+        chosenIndex,
+        correctIndex,
+      });
+      setDragOverIndex(null);
+      setDraggingPending(false);
 
-    if (nextQueue.length === 0) {
-      setIsComplete(true);
-    }
-  }, [correctCount, isComplete, pendingQueue, pendingTerm, rankByTerm, revealedItems]);
+      if (nextQueue.length === 0) {
+        setIsComplete(true);
+      }
+    },
+    [correctCount, isComplete, pendingQueue, pendingTerm, rankByTerm, revealedItems],
+  );
 
-  const getInsertionIndexFromY = useCallback((clientY) => {
-    for (let i = 0; i < revealedItems.length; i++) {
-      const node = itemRefs.current[i];
-      if (!node) continue;
-      const rect = node.getBoundingClientRect();
-      const mid = rect.top + rect.height / 2;
-      if (clientY < mid) return i;
-    }
-    return revealedItems.length;
-  }, [revealedItems.length]);
+  const getInsertionIndexFromY = useCallback(
+    (clientY) => {
+      for (let i = 0; i < revealedItems.length; i++) {
+        const node = itemRefs.current[i];
+        if (!node) continue;
+        const rect = node.getBoundingClientRect();
+        const mid = rect.top + rect.height / 2;
+        if (clientY < mid) return i;
+      }
+      return revealedItems.length;
+    },
+    [revealedItems],
+  );
 
   const onDragStartPending = (event) => {
     event.dataTransfer.effectAllowed = "move";
@@ -754,7 +400,6 @@ export default function OnTrendsGame() {
   };
 
   const resolveDisplayName = useCallback(async () => {
-    if (useLocalMode) return "Local Player";
     try {
       const attrs = await fetchUserAttributes();
       const user = await getCurrentUser();
@@ -767,7 +412,7 @@ export default function OnTrendsGame() {
     } catch {
       return "Player";
     }
-  }, [useLocalMode]);
+  }, []);
 
   const saveScore = useCallback(async () => {
     setSaveError("");
@@ -779,35 +424,6 @@ export default function OnTrendsGame() {
 
     try {
       const mistakes = TOTAL_ITEMS - correctCount;
-
-      if (useLocalMode) {
-        const name = "Local Player";
-        const rows = readLocalLeaderboard(puzzleId);
-        const existingIdx = rows.findIndex((x) => x?.userId === LOCAL_USER_ID);
-        const entry = {
-          userId: LOCAL_USER_ID,
-          puzzleId,
-          name,
-          correctCount,
-          mistakes,
-          placementLog,
-          createdAt: new Date().toISOString(),
-        };
-
-        if (existingIdx >= 0) {
-          const old = rows[existingIdx];
-          if ((entry.mistakes ?? 99) <= (old?.mistakes ?? 99)) {
-            rows[existingIdx] = entry;
-          }
-        } else {
-          rows.push(entry);
-        }
-
-        writeLocalLeaderboard(puzzleId, rows);
-        setHasSavedScore(true);
-        await fetchLeaderboard(puzzleId);
-        return;
-      }
 
       let userId = "";
       try {
@@ -851,7 +467,7 @@ export default function OnTrendsGame() {
               mistakes,
               placementLog,
             },
-            { authMode: "userPool" }
+            { authMode: "userPool" },
           );
         } else if (existing.name !== name) {
           await client.models.TrendScore.update(
@@ -859,7 +475,7 @@ export default function OnTrendsGame() {
               id,
               name,
             },
-            { authMode: "userPool" }
+            { authMode: "userPool" },
           );
         }
       } else {
@@ -873,7 +489,7 @@ export default function OnTrendsGame() {
             mistakes,
             placementLog,
           },
-          { authMode: "userPool" }
+          { authMode: "userPool" },
         );
       }
 
@@ -886,192 +502,259 @@ export default function OnTrendsGame() {
     } finally {
       setIsSavingScore(false);
     }
-  }, [correctCount, fetchLeaderboard, isComplete, placementLog, puzzleId, resolveDisplayName, useLocalMode]);
+  }, [correctCount, fetchLeaderboard, isComplete, placementLog, puzzleId, resolveDisplayName]);
 
   useEffect(() => {
     if (!isComplete || hasSavedScore || isSavingScore) return;
-    if (!useLocalMode && !isAuthed) return;
+    if (!isAuthed) return;
     saveScore();
-  }, [hasSavedScore, isAuthed, isComplete, isSavingScore, saveScore, useLocalMode]);
+  }, [hasSavedScore, isAuthed, isComplete, isSavingScore, saveScore]);
+
+  useEffect(() => {
+    if (puzzleCloudState !== "ready" || isComplete || !pendingTerm) return undefined;
+    const onKey = (e) => {
+      if (e.defaultPrevented) return;
+      const tag = e.target?.tagName?.toLowerCase?.() || "";
+      if (tag === "input" || tag === "textarea" || tag === "select" || e.target?.isContentEditable) return;
+      const k = e.key;
+      if (k < "1" || k > "5") return;
+      const idx = Number.parseInt(k, 10) - 1;
+      const max = revealedItems.length;
+      if (idx >= 0 && idx <= max) {
+        e.preventDefault();
+        placePendingAtIndex(idx);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [puzzleCloudState, isComplete, pendingTerm, revealedItems.length, placePendingAtIndex]);
+
+  const showGame = puzzleCloudState === "ready" && orderedItems.length === TOTAL_ITEMS;
+  const mistakesSoFar = TOTAL_ITEMS - correctCount;
 
   return (
     <div className="min-h-screen bg-white font-['Helvetica_Neue',_sans-serif]">
       <div className="max-w-4xl mx-auto px-6 py-12">
-        {puzzleLoading && (
-          <div className="fixed inset-0 z-40 bg-white flex items-center justify-center">
+        {puzzleCloudState === "loading" && (
+          <div className="fixed inset-0 z-40 bg-white/90 flex flex-col items-center justify-center gap-4">
             <PillHighlight text="LOADING" />
+            <p className="text-sm text-gray-500">Fetching today’s puzzle from the cloud…</p>
+          </div>
+        )}
+
+        {puzzleCloudState === "pending" && (
+          <div className="mb-8 rounded-xl border border-amber-200 bg-amber-50 p-6 text-center">
+            <h2 className="text-lg font-semibold text-amber-900">Puzzle not ready</h2>
+            <p className="text-sm text-amber-800 mt-2">
+              Today’s row exists but ranking is still pending. The scheduled Lambda usually fills it ahead of time.
+            </p>
+            <button
+              type="button"
+              onClick={() => setPuzzleRetryTick((n) => n + 1)}
+              className="mt-4 px-4 py-2 rounded-md bg-amber-700 text-white text-sm font-medium hover:bg-amber-800"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {(puzzleCloudState === "failed" || puzzleCloudState === "missing") && (
+          <div className="mb-8 rounded-xl border border-red-200 bg-red-50 p-6 text-center">
+            <h2 className="text-lg font-semibold text-red-900">Could not load puzzle</h2>
+            <p className="text-sm text-red-800 mt-2 whitespace-pre-wrap">{puzzleError}</p>
+            <button
+              type="button"
+              onClick={() => setPuzzleRetryTick((n) => n + 1)}
+              className="mt-4 px-4 py-2 rounded-md bg-red-700 text-white text-sm font-medium hover:bg-red-800"
+            >
+              Retry
+            </button>
           </div>
         )}
 
         <header className="text-center mb-12">
           <h1 className="text-4xl font-bold text-black tracking-tight">On Trends</h1>
           <p className="text-gray-600 mt-2">Drag each incoming trend into the correct global ranking position.</p>
-          {topicSeed && <p className="text-sm text-gray-500 mt-1">Seed: {topicSeed}</p>}
+          {topicSeed ? <p className="text-sm text-gray-500 mt-1">Seed: {topicSeed}</p> : null}
           <p className="text-xs text-gray-400 mt-1">Window: {timeframe}</p>
-          {puzzleId && <p className="text-xs text-gray-400 mt-1">Puzzle {puzzleId}</p>}
-          {useLocalMode && (
-            <p className="text-xs mt-2 inline-block px-2 py-1 rounded bg-amber-50 border border-amber-200 text-amber-700">
-              Local Mode: using trends algorithm via Vite proxy
-            </p>
-          )}
+          {puzzleId ? <p className="text-xs text-gray-400 mt-1">Puzzle {puzzleId}</p> : null}
         </header>
 
-        <section className="bg-gray-50 border border-gray-200 rounded-xl p-6 mb-8">
-          <div className="flex items-center justify-between mb-4">
-            <div className="text-sm font-semibold text-gray-700">Progress {progress}/{TOTAL_ITEMS}</div>
-            <div className="text-sm font-semibold text-gray-700">Score {correctCount}/{TOTAL_ITEMS}</div>
-          </div>
-
-          {!isComplete && pendingTerm && (
-            <div className="mb-6 text-center">
-              <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">Drag this trend</div>
-              <div
-                draggable
-                onDragStart={onDragStartPending}
-                onDragEnd={onDragEndPending}
-                className={`inline-block px-4 py-2 rounded-lg border-2 border-black bg-white text-lg font-bold cursor-grab active:cursor-grabbing ${draggingPending ? "opacity-60" : "opacity-100"}`}
-              >
-                {pendingTerm}
+        {showGame && (
+          <section className="bg-gray-50 border border-gray-200 rounded-xl p-6 mb-8">
+            <div className="flex items-center justify-between mb-4">
+              <div className="text-sm font-semibold text-gray-700">
+                Progress {progress}/{TOTAL_ITEMS}
+              </div>
+              <div className="text-sm font-semibold text-gray-700">
+                Score {correctCount}/{TOTAL_ITEMS}
+                {!isComplete ? (
+                  <span className="text-gray-500 font-normal ml-2">({mistakesSoFar} mistake{mistakesSoFar === 1 ? "" : "s"} so far)</span>
+                ) : null}
               </div>
             </div>
-          )}
 
-          <div
-            ref={listContainerRef}
-            onDragOver={onListDragOver}
-            onDrop={onListDrop}
-            onDragLeave={() => setDragOverIndex(null)}
-            className="space-y-2"
-          >
-            {revealedItems.map((term, index) => (
-              <div key={`${term}-${index}`} className="relative">
-                {draggingPending && dragOverIndex === index && (
-                  <div className="absolute -top-2 left-2 right-2 h-1 rounded bg-black/70" />
-                )}
+            {!isComplete && pendingTerm && (
+              <div className="mb-6 text-center">
+                <div className="text-xs uppercase tracking-wide text-gray-500 mb-2">Drag or tap a row below</div>
                 <div
-                  ref={(node) => {
-                    itemRefs.current[index] = node;
-                  }}
-                  className="w-full px-4 py-3 bg-white border border-gray-300 rounded-lg font-semibold text-gray-900 transition-transform duration-150"
-                  style={{
-                    transform: draggingPending && dragOverIndex !== null && index >= dragOverIndex ? "translateY(10px)" : "translateY(0)",
-                  }}
+                  draggable
+                  onDragStart={onDragStartPending}
+                  onDragEnd={onDragEndPending}
+                  className={`inline-block px-4 py-2 rounded-lg border-2 border-black bg-white text-lg font-bold cursor-grab active:cursor-grabbing ${
+                    draggingPending ? "opacity-60" : "opacity-100"
+                  }`}
                 >
-                  {term}
+                  {pendingTerm}
                 </div>
               </div>
-            ))}
-            {draggingPending && dragOverIndex === revealedItems.length && (
-              <div className="h-1 rounded bg-black/70 mx-2" />
             )}
-          </div>
 
-          {lastResult && (
             <div
-              className={`mt-4 px-4 py-3 rounded-md text-sm font-medium ${
-                lastResult.wasCorrect
-                  ? "bg-green-50 border border-green-200 text-green-700"
-                  : "bg-red-50 border border-red-200 text-red-700"
-              }`}
+              ref={listContainerRef}
+              onDragOver={onListDragOver}
+              onDrop={onListDrop}
+              onDragLeave={() => setDragOverIndex(null)}
+              className="space-y-2"
             >
-              {lastResult.wasCorrect
-                ? `${lastResult.term} placed correctly.`
-                : `${lastResult.term} was incorrect. Snapped to position ${lastResult.correctIndex + 1}.`}
+              {revealedItems.map((term, index) => (
+                <div key={`${term}-${index}`} className="relative">
+                  {draggingPending && dragOverIndex === index && (
+                    <div className="absolute -top-2 left-2 right-2 h-1 rounded bg-black/70" />
+                  )}
+                  <button
+                    type="button"
+                    disabled={!pendingTerm || isComplete}
+                    onClick={() => placePendingAtIndex(index)}
+                    ref={(node) => {
+                      itemRefs.current[index] = node;
+                    }}
+                    className="w-full text-left px-4 py-3 bg-white border border-gray-300 rounded-lg font-semibold text-gray-900 transition-transform duration-150 hover:border-gray-500 disabled:opacity-60 disabled:cursor-not-allowed"
+                    style={{
+                      transform:
+                        draggingPending && dragOverIndex !== null && index >= dragOverIndex
+                          ? "translateY(10px)"
+                          : "translateY(0)",
+                    }}
+                  >
+                    {term}
+                  </button>
+                </div>
+              ))}
+              {draggingPending && dragOverIndex === revealedItems.length && (
+                <div className="h-1 rounded bg-black/70 mx-2" />
+              )}
             </div>
-          )}
-        </section>
 
-        {isComplete && (
+            {lastResult && (
+              <div
+                className={`mt-4 px-4 py-3 rounded-md text-sm font-medium ${
+                  lastResult.wasCorrect
+                    ? "bg-green-50 border border-green-200 text-green-700"
+                    : "bg-red-50 border border-red-200 text-red-700"
+                }`}
+              >
+                {lastResult.wasCorrect
+                  ? `${lastResult.term} placed correctly.`
+                  : `${lastResult.term} was incorrect. Snapped to position ${lastResult.correctIndex + 1}.`}
+              </div>
+            )}
+          </section>
+        )}
+
+        {isComplete && showGame && (
           <section className="bg-green-50 border border-green-200 rounded-xl p-6 mb-8 text-center">
             <h2 className="text-2xl font-bold text-green-800">Round Complete</h2>
             <p className="text-green-700 mt-2">
               Final score: {correctCount}/{TOTAL_ITEMS} ({TOTAL_ITEMS - correctCount} mistake{TOTAL_ITEMS - correctCount === 1 ? "" : "s"})
             </p>
-            {!isAuthed && !useLocalMode && (
+            {!isAuthed && (
               <button
+                type="button"
                 onClick={() => setAuthOpen(true)}
                 className="mt-4 px-5 py-2 bg-blue-600 text-white font-semibold rounded-md hover:bg-blue-700"
               >
                 Sign in to save score
               </button>
             )}
-            {saveError && <div className="text-red-600 text-sm mt-2">{saveError}</div>}
+            {saveError ? <div className="text-red-600 text-sm mt-2">{saveError}</div> : null}
           </section>
         )}
 
-        <section className="border border-gray-200 rounded-xl p-6">
-          <h3 className="text-xl font-bold mb-4">Leaderboard</h3>
-          <div className="space-y-2 max-h-72 overflow-y-auto">
-            {leaderboard.map((entry, index) => (
-              <div
-                key={`${entry.userId || entry.name}-${index}`}
-                className={`flex justify-between items-center p-3 rounded-lg border ${
-                  entry.userId && myUserId && entry.userId === myUserId
-                    ? "bg-yellow-50 border-yellow-300"
-                    : "bg-gray-50 border-gray-200"
-                }`}
-              >
-                <div className="font-semibold text-gray-800">{index + 1}. {entry.name}</div>
-                <div className="text-sm text-gray-600">
-                  {entry.correctCount}/{TOTAL_ITEMS} | {entry.mistakes} mistakes
-                </div>
+        {showGame && (
+          <section className="border border-gray-200 rounded-xl p-6">
+            <h3 className="text-xl font-bold mb-4">Leaderboard</h3>
+            {leaderboardLoading ? (
+              <div className="animate-pulse space-y-2">
+                <div className="h-10 bg-gray-100 rounded-lg" />
+                <div className="h-10 bg-gray-100 rounded-lg" />
+                <div className="h-10 bg-gray-100 rounded-lg" />
               </div>
-            ))}
-            {leaderboard.length === 0 && <div className="text-gray-500 text-sm">No scores yet.</div>}
-          </div>
-        </section>
+            ) : (
+              <div className="space-y-2 max-h-72 overflow-y-auto">
+                {leaderboardError ? (
+                  <p className="text-sm text-amber-700">{leaderboardError}</p>
+                ) : null}
+                {leaderboard.map((entry, index) => (
+                  <div
+                    key={`${entry.userId || entry.name}-${index}`}
+                    className={`flex justify-between items-center p-3 rounded-lg border ${
+                      entry.userId && myUserId && entry.userId === myUserId
+                        ? "bg-yellow-50 border-yellow-300"
+                        : "bg-gray-50 border-gray-200"
+                    }`}
+                  >
+                    <div className="font-semibold text-gray-800">
+                      {index + 1}. {entry.name}
+                    </div>
+                    <div className="text-sm text-gray-600">
+                      {entry.correctCount}/{TOTAL_ITEMS} | {entry.mistakes} mistakes
+                    </div>
+                  </div>
+                ))}
+                {!leaderboardLoading && leaderboard.length === 0 && !leaderboardError ? (
+                  <div className="text-gray-500 text-sm">No scores yet.</div>
+                ) : null}
+              </div>
+            )}
+          </section>
+        )}
 
-        <section className="mt-8 bg-gray-50 rounded-lg p-5 text-sm text-gray-600">
-          <strong>How to play:</strong> Drag one incoming trend into the list.
-          The list shifts while dragging. If you are wrong, the term snaps to the correct position and play continues.
-        </section>
+        {showGame && (
+          <section className="mt-8 bg-gray-50 rounded-lg p-5 text-sm text-gray-600">
+            <strong>How to play:</strong> Drag the highlighted trend into the list, or tap the row where it belongs. The
+            list shifts while dragging.             Wrong placements snap to the correct slot; play continues until all five are
+            placed. Keyboard: press 1–5 to choose the row where the incoming trend belongs (1 is top).
+          </section>
+        )}
 
-        {!useLocalMode && authOpen && (
+        {authOpen && (
           <div className="fixed inset-0 bg-black/30 backdrop-blur-sm flex items-center justify-center z-50 p-4">
             <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[90vh] overflow-auto">
               <div className="px-6 py-4 border-b flex items-center justify-between">
                 <div className="text-lg font-semibold">Sign in to Save</div>
-                <button onClick={() => setAuthOpen(false)} className="text-gray-500 text-2xl leading-none">x</button>
+                <button type="button" onClick={() => setAuthOpen(false)} className="text-gray-500 text-2xl leading-none">
+                  ×
+                </button>
               </div>
               <div className="p-6">
-                <Authenticator
-                  loginMechanisms={["email"]}
-                  socialProviders={[]}
-                  formFields={{
-                    signIn: {
-                      username: { label: "Email", placeholder: "your@email.com" },
-                    },
-                    signUp: {
-                      email: { label: "Email", placeholder: "your@email.com" },
-                      preferred_username: { label: "Username", placeholder: "Your username" },
-                      password: { label: "Password" },
-                      confirm_password: { label: "Confirm Password" },
-                    },
-                  }}
-                >
-                  {({ user, signOut }) => {
-                    if (user && !isAuthed) {
-                      setTimeout(() => setIsAuthed(true), 0);
-                      setTimeout(() => setAuthOpen(false), 0);
-                    }
-
-                    if (user) {
-                      return (
-                        <div className="flex flex-col items-center gap-3">
-                          <div className="text-sm text-gray-700">Signed in</div>
-                          <button
-                            onClick={signOut}
-                            className="px-3 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50"
-                          >
-                            Sign out
-                          </button>
-                        </div>
-                      );
-                    }
-
-                    return null;
-                  }}
-                </Authenticator>
+                <Suspense fallback={<div className="text-sm text-gray-500">Loading sign-in…</div>}>
+                  <LazyAuthenticator
+                    loginMechanisms={["email"]}
+                    socialProviders={[]}
+                    formFields={{
+                      signIn: {
+                        username: { label: "Email", placeholder: "your@email.com" },
+                      },
+                      signUp: {
+                        email: { label: "Email", placeholder: "your@email.com" },
+                        preferred_username: { label: "Username", placeholder: "Your username" },
+                        password: { label: "Password" },
+                        confirm_password: { label: "Confirm Password" },
+                      },
+                    }}
+                  />
+                </Suspense>
               </div>
             </div>
           </div>

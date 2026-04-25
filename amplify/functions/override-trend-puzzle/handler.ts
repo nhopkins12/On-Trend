@@ -3,7 +3,7 @@ import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
 import { env } from "$amplify/env/override-trend-puzzle";
-import { dateIdInToronto, deriveStatusForDate, generateTrendPuzzle } from "../shared/trends";
+import { deriveStatusForDate, generateTrendPuzzle, puzzleDateId } from "../shared/trends";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
 Amplify.configure(resourceConfig, libraryOptions);
@@ -11,17 +11,21 @@ Amplify.configure(resourceConfig, libraryOptions);
 const client = generateClient<Schema>();
 const authOptions = { authMode: "iam" as const };
 
+function logJson(payload: Record<string, unknown>) {
+  console.log(JSON.stringify({ source: "override-trend-puzzle", ...payload }));
+}
+
 export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (event) => {
   const id = String(event.arguments?.id || "").slice(0, 10);
   const requestedStatus = String(event.arguments?.status || "").toLowerCase();
   const topicSeed = String(event.arguments?.topicSeed || "").trim();
-  const sourceDate = String(event.arguments?.sourceDate || dateIdInToronto(0)).slice(0, 10);
+  const sourceDate = String(event.arguments?.sourceDate || puzzleDateId(0)).slice(0, 10);
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(id)) {
     return { ok: false, message: "Invalid id format; expected YYYY-MM-DD" };
   }
 
-  const todayId = dateIdInToronto(0);
+  const todayId = puzzleDateId(0);
   const status = (requestedStatus === "active" || requestedStatus === "next" || requestedStatus === "archived")
     ? requestedStatus
     : deriveStatusForDate(id, todayId);
@@ -34,6 +38,7 @@ export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (
       forcedSeed: topicSeed || undefined,
     });
   } catch (err: any) {
+    logJson({ event: "override_failed", id, message: err?.message || String(err) });
     return {
       ok: false,
       message: `Failed generating trend puzzle: ${err?.message || "unknown error"}`,
@@ -76,6 +81,7 @@ export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (
     }
   }
 
+  logJson({ event: "override_ok", id, status, itemCount: generated.items.length });
   return {
     ok: true,
     id,

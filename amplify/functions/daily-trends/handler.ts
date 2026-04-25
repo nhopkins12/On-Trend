@@ -5,7 +5,7 @@ import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
 import { env } from "$amplify/env/daily-trends";
-import { dateIdInToronto, generateTrendPuzzle } from "../shared/trends";
+import { generateTrendPuzzle, puzzleDateId } from "../shared/trends";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
 Amplify.configure(resourceConfig, libraryOptions);
@@ -13,9 +13,13 @@ Amplify.configure(resourceConfig, libraryOptions);
 const client = generateClient<Schema>();
 const authOptions = { authMode: "iam" as const };
 
+function logJson(payload: Record<string, unknown>) {
+  console.log(JSON.stringify({ source: "daily-trends", ...payload }));
+}
+
 export const handler: EventBridgeHandler<"Scheduled Event", null, void> = async () => {
-  const todayId = dateIdInToronto(0);
-  const tomorrowId = dateIdInToronto(1);
+  const todayId = puzzleDateId(0);
+  const tomorrowId = puzzleDateId(1);
 
   try {
     const { data: todayPuzzle } = await client.models.DailyTrendPuzzle.get({ id: todayId }, authOptions);
@@ -68,14 +72,19 @@ export const handler: EventBridgeHandler<"Scheduled Event", null, void> = async 
         timeframe: generated.timeframe,
         computeState: "ready",
       };
+      logJson({ event: "puzzle_generated", puzzleId: tomorrowId, itemCount: generated.items.length });
     } catch (err) {
-      console.warn("Trend generation failed", err);
+      logJson({
+        event: "puzzle_generation_failed",
+        puzzleId: tomorrowId,
+        message: err instanceof Error ? err.message : String(err),
+      });
       payload = {
         ...payload,
         topicSeed: "",
         sourceDate: todayId,
         items: [],
-        timeframe: "now 1-d",
+        timeframe: "now 7-d",
         computeState: "failed",
       };
     }

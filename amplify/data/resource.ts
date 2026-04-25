@@ -41,7 +41,7 @@ const schema = a
         sourceDate: a.string(),
       })
       .returns(a.json())
-      .authorization((allow) => [allow.publicApiKey()])
+      .authorization((allow) => [allow.authenticated()])
       .handler(a.handler.function(overrideTrendPuzzle)),
   })
   .authorization((allow) => [allow.resource(dailyTrends), allow.resource(overrideTrendPuzzle)]);
