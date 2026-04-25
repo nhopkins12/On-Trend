@@ -321,12 +321,9 @@ async function fetchLegacyDailyCandidates(): Promise<string[]> {
 
 async function fetchDailyCandidates(): Promise<string[]> {
   const legacy = await fetchLegacyDailyCandidates();
-  if (legacy.length) return legacy;
-
   const rss = await fetchRssDailyCandidates();
-  if (rss.length) {
-    return rss;
-  }
+  const merged = Array.from(new Set([...legacy, ...rss]));
+  if (merged.length) return merged;
 
   throw new Error("No candidates available from Google Trends sources.");
 }
