@@ -14,8 +14,11 @@ const SERPAPI_REGION = "US";
 const STRATIFIED_HEAD_WINDOW = 30;
 /** Minimum ordered candidates (after merge) to attempt stratified pick. */
 const MIN_ORDERED_CANDIDATES = 5;
-/** Max pick attempts (rotation) when post-rank score spread is too flat. */
-const PICK_MAX_ATTEMPTS = 3;
+/**
+ * Max full pick+rank cycles: low score spread, incomplete interest data (e.g. niche / one-word queries),
+ * or transient Google empty timeline — each retry advances `attempt` so quintile / shuffle selection changes.
+ */
+const GENERATION_MAX_ATTEMPTS = 5;
 /**
  * Min spread (max score − min) on 0–100 scale after ranking; if below, rotate indices and re-rank.
  */
@@ -758,7 +761,7 @@ export async function generateTrendPuzzle(options) {
         rawCount: candidates.length,
         headPreview: candidates.slice(0, 5),
     });
-    for (let attempt = 0; attempt < PICK_MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < GENERATION_MAX_ATTEMPTS; attempt++) {
         let pickedTerms;
         try {
             if (strategy === "legacy") {
@@ -780,14 +783,24 @@ export async function generateTrendPuzzle(options) {
         }
         catch (e) {
             const err = e instanceof Error ? e : new Error(String(e));
+            const canRetry = attempt < GENERATION_MAX_ATTEMPTS - 1;
             logStage({
                 stage: "rank_failed",
                 puzzleId: options.puzzleId,
                 attempt,
                 pickedTerms,
                 error: err.message,
+                willRetry: canRetry,
                 ms: Date.now() - t0,
             });
+            if (canRetry) {
+                logStage({
+                    stage: "rank_retry_new_pick",
+                    puzzleId: options.puzzleId,
+                    nextAttempt: attempt + 1,
+                });
+                continue;
+            }
             throw err;
         }
         const spread = scoreSpread(scores);
@@ -815,7 +828,7 @@ export async function generateTrendPuzzle(options) {
             maxScore: Math.max(...[...scores.values()]),
             ms: Date.now() - t0,
         });
-        if (spread >= MIN_SCORE_SPREAD || attempt === PICK_MAX_ATTEMPTS - 1) {
+        if (spread >= MIN_SCORE_SPREAD || attempt === GENERATION_MAX_ATTEMPTS - 1) {
             if (spread < MIN_SCORE_SPREAD) {
                 logStage({
                     stage: "low_spread_accepted",
