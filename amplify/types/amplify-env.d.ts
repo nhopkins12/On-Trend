@@ -9,7 +9,7 @@ declare module "$amplify/env/daily-trends" {
   };
 }
 
-declare module "$amplify/env/override-trend-puzzle" {
+declare module "$amplify/env/regenerate-daily-puzzle" {
   export const env: {
     AWS_ACCESS_KEY_ID: string;
     AWS_SECRET_ACCESS_KEY: string;

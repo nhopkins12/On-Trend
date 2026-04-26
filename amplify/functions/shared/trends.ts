@@ -12,7 +12,6 @@ export const MIN_PUZZLE_FRIENDLY_POOL = 10;
 /** Cap candidate pool size for legacy shuffle (performance). */
 export const MAX_CANDIDATES_FOR_SAMPLE = 40;
 export const FIXED_TIMEFRAME = "now 7-d";
-const DAILY_RSS_GEOS = ["US"];
 const SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
 const SERPAPI_ENGINE = "google_trends";
 const SERPAPI_REGION = "US";
@@ -25,13 +24,21 @@ const MIN_ORDERED_CANDIDATES = 5;
  * Max full pick+rank cycles: low score spread, incomplete interest data (e.g. niche / one-word queries),
  * or transient Google empty timeline — each retry advances `attempt` so quintile / shuffle selection changes.
  */
-const GENERATION_MAX_ATTEMPTS = 5;
+export const GENERATION_MAX_ATTEMPTS = 5;
+/** When direct Google has no data for a term, swap it for the next from the list before re-ranking. */
+const MAX_FAILED_TERM_SUBSTITUTIONS = 12;
+/** Set with SERPAPI_KEY: skip scraping Google; use SerpAPI only. */
+const skipDirect = (): boolean => String(process.env.TRENDS_SKIP_DIRECT || "").trim() === "1";
+const serpKey = (): string | undefined => {
+  const k = String(process.env.SERPAPI_KEY || "").trim();
+  return k || undefined;
+};
 /**
  * Min spread (max score − min) on 0–100 scale after ranking; if below, rotate indices and re-rank.
  */
-const MIN_SCORE_SPREAD = 3.0;
+export const MIN_SCORE_SPREAD = 3.0;
 /** `stratified` (default) = list-anchored quintile pick; `legacy` = old shuffle pool. */
-const pickStrategy = (): "stratified" | "legacy" =>
+export const getPuzzlePickStrategy = (): "stratified" | "legacy" =>
   String(process.env.PUZZLE_PICK_STRATEGY || "stratified")
     .trim()
     .toLowerCase() === "legacy"
@@ -108,11 +115,11 @@ function logStage(payload: Record<string, unknown>) {
   console.log(JSON.stringify({ source: "trends.generateTrendPuzzle", ...payload }));
 }
 
-function stripXssi(text: string): string {
+export function stripXssi(text: string): string {
   return text.replace(/^\)\]\}',?\n/, "");
 }
 
-function decodeXmlEntities(input: string): string {
+export function decodeXmlEntities(input: string): string {
   return input
     .replace(/&amp;/g, "&")
     .replace(/&quot;/g, '"')
@@ -191,7 +198,7 @@ function trendsOrigin(): string {
   return (process.env.TRENDS_ORIGIN || "https://trends.google.com").replace(/\/$/, "");
 }
 
-function trendsUrl(pathWithLeadingSlash: string): string {
+export function trendsUrl(pathWithLeadingSlash: string): string {
   const p = pathWithLeadingSlash.startsWith("/") ? pathWithLeadingSlash : `/${pathWithLeadingSlash}`;
   return `${trendsOrigin()}${p}`;
 }
@@ -387,7 +394,7 @@ function fillPickedFromOrdered(orderedFull: string[], start: string[], puzzleId:
   return out.slice(0, TREND_ITEMS_PER_PUZZLE);
 }
 
-async function fetchText(url: string): Promise<string> {
+export async function fetchText(url: string): Promise<string> {
   const maxAttempts = 3;
   let lastError: unknown = null;
 
@@ -428,96 +435,6 @@ async function fetchText(url: string): Promise<string> {
 async function fetchJson(url: string): Promise<any> {
   const txt = await fetchText(url);
   return JSON.parse(txt);
-}
-
-function parseDailyRssTitlesOrdered(xmlText: string): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  const itemMatches = xmlText.match(/<item>[\s\S]*?<\/item>/g) || [];
-
-  for (const block of itemMatches) {
-    const titleMatch = block.match(/<title>([\s\S]*?)<\/title>/i);
-    if (!titleMatch?.[1]) continue;
-    const clean = sanitizeTerm(decodeXmlEntities(titleMatch[1]));
-    if (clean) {
-      const k = clean.toLowerCase();
-      if (!seen.has(k)) {
-        seen.add(k);
-        out.push(clean);
-      }
-    }
-  }
-  return out;
-}
-
-async function fetchRssDailyOrdered(): Promise<string[]> {
-  const merged: string[] = [];
-  for (const geo of DAILY_RSS_GEOS) {
-    try {
-      const txt = await fetchText(
-        trendsUrl(`/trending/rss?geo=${encodeURIComponent(geo)}`),
-      );
-      merged.push(...parseDailyRssTitlesOrdered(txt));
-    } catch {
-      // no-op
-    }
-  }
-  const seen = new Set<string>();
-  const ordered: string[] = [];
-  for (const t of merged) {
-    const k = t.toLowerCase();
-    if (seen.has(k)) continue;
-    seen.add(k);
-    ordered.push(t);
-  }
-  return ordered;
-}
-
-/**
- * Preserves Google dailytrends `trendingSearches` order; dedupes by first occurrence (case-insensitive).
- */
-function parseLegacyDailyListOrderedFromPayload(payload: any): string[] {
-  const latestDay = payload?.default?.trendingSearchesDays?.[0];
-  const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const entry of list) {
-    const clean = sanitizeTerm(entry?.title?.query);
-    if (clean) {
-      const k = clean.toLowerCase();
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push(clean);
-    }
-  }
-  return out;
-}
-
-async function fetchLegacyDailyCandidatesOrdered(): Promise<string[]> {
-  const urls = [
-    "/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
-    "/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
-  ];
-
-  for (const path of urls) {
-    try {
-      const txt = await fetchText(trendsUrl(path));
-      const payload = JSON.parse(stripXssi(txt));
-      const out = parseLegacyDailyListOrderedFromPayload(payload);
-      if (out.length) return out;
-    } catch {
-      // try next variant
-    }
-  }
-  return [];
-}
-
-async function fetchDailyCandidates(): Promise<string[]> {
-  const legacy = await fetchLegacyDailyCandidatesOrdered();
-  const rss = await fetchRssDailyOrdered();
-  const merged = mergeOrderedUnique(legacy, rss);
-  if (merged.length) return merged;
-  throw new Error("No candidates available from Google Trends sources.");
 }
 
 function chunkArray<T>(items: T[], chunkSize: number): T[][] {
@@ -739,23 +656,30 @@ function scoreMapGetCaseInsensitive(map: Map<string, number>, term: string): num
   return undefined;
 }
 
+type RankMode = "direct" | "vendor";
+
+function makeIncompleteError(t: string, mode: RankMode, hint?: string): Error {
+  const base = `Incomplete Google Trends interest data for term "${t}" (mode=${mode}).`;
+  const h =
+    hint ||
+    "Set SERPAPI_KEY (auto-tries SerpAPI after direct) or TRENDS_FETCH_MODE=vendor, TRENDS_SKIP_DIRECT=1, or a working TRENDS_ORIGIN proxy.";
+  return new Error(`${base} ${h}`);
+}
+
 /**
- * Ranks exactly five terms using one transport: direct/proxy Google scrape, or SerpAPI google_trends (vendor).
- * Throws if any term lacks a finite score (no silent placeholder ordering).
+ * Ranks 5 terms with a single transport; throws if any term has no score.
  */
-async function rankFiveTermsStrict(terms: string[]): Promise<Map<string, number>> {
+async function rankFiveTermsStrictForMode(terms: string[], mode: RankMode): Promise<Map<string, number>> {
   const normalized = terms.map((t) => sanitizeTerm(t)).filter((x): x is string => Boolean(x));
   if (normalized.length !== TREND_ITEMS_PER_PUZZLE) {
     throw new Error(`Expected ${TREND_ITEMS_PER_PUZZLE} sanitized terms for ranking, got ${normalized.length}`);
   }
 
-  const mode = String(process.env.TRENDS_FETCH_MODE || "direct").trim().toLowerCase();
   let raw: Map<string, number>;
-
   if (mode === "vendor") {
-    const key = String(process.env.SERPAPI_KEY || "").trim();
+    const key = serpKey();
     if (!key) {
-      throw new Error("TRENDS_FETCH_MODE=vendor requires SERPAPI_KEY");
+      throw new Error("SERPAPI_KEY is required for vendor / SerpAPI ranking");
     }
     raw = await rankTermsBySerpApiInterest(normalized, key);
   } else {
@@ -766,13 +690,123 @@ async function rankFiveTermsStrict(terms: string[]): Promise<Map<string, number>
   for (const t of normalized) {
     const s = scoreMapGetCaseInsensitive(raw, t);
     if (typeof s !== "number" || !Number.isFinite(s)) {
-      throw new Error(
-        `Incomplete Google Trends interest data for term "${t}" (mode=${mode}). Check TRENDS_ORIGIN proxy or switch TRENDS_FETCH_MODE=vendor with SERPAPI_KEY.`,
-      );
+      throw makeIncompleteError(t, mode);
     }
     out.set(t, s);
   }
   return out;
+}
+
+/**
+ * Resolves 5 interest scores. Order of attempts:
+ * - `TRENDS_FETCH_MODE=vendor` (or TRENDS_SKIP_DIRECT=1): SerpAPI only
+ * - Else: direct (Google) first; on **any** incomplete term, if `SERPAPI_KEY` is set, one retry with SerpAPI for the same 5
+ */
+async function rankFiveWithTransportAndFallback(terms: string[], puzzleId: string): Promise<Map<string, number>> {
+  const explicit = String(process.env.TRENDS_FETCH_MODE || "direct")
+    .trim()
+    .toLowerCase();
+  if (skipDirect() || explicit === "vendor") {
+    const k = serpKey();
+    if (!k) {
+      throw new Error("TRENDS_FETCH_MODE=vendor or TRENDS_SKIP_DIRECT=1 requires SERPAPI_KEY");
+    }
+    logStage({ stage: "rank_transport", transport: "vendor", puzzleId, reason: "explicit_or_skip_direct" });
+    return rankFiveTermsStrictForMode(terms, "vendor");
+  }
+
+  try {
+    logStage({ stage: "rank_transport", transport: "direct", puzzleId });
+    return await rankFiveTermsStrictForMode(terms, "direct");
+  } catch (e) {
+    const k = serpKey();
+    if (k) {
+      logStage({
+        stage: "serpapi_fallback",
+        puzzleId,
+        afterError: e instanceof Error ? e.message : String(e),
+      });
+      return rankFiveTermsStrictForMode(terms, "vendor");
+    }
+    throw e;
+  }
+}
+
+/** From strict rank error, extract the first quoted term. */
+function parseFirstQuotedTermInMessage(msg: string): string | null {
+  const m = msg.match(/for term "([^"]+)"/i);
+  return m?.[1] ?? null;
+}
+
+/**
+ * Replaces one failed term in `current` with the first acceptable candidate in `ordered` (by list order) not already in the pick.
+ * Respects `forced` as immovable: returns null if the missing term is forced.
+ */
+function substituteOneFailedTerm(
+  current: string[],
+  failedDisplayTerm: string,
+  ordered: string[],
+  forced: string | null,
+): string[] | null {
+  const failLower = failedDisplayTerm.toLowerCase();
+  if (forced && failLower === forced.toLowerCase()) {
+    return null;
+  }
+  const inPick = (t: string) => current.some((x) => x.toLowerCase() === t.toLowerCase());
+  for (const c of ordered) {
+    if (!c) continue;
+    if (c.toLowerCase() === failLower) continue;
+    if (inPick(c)) continue;
+    if (!isPuzzleAcceptableLoose(c)) continue;
+    return current.map((t) => (t.toLowerCase() === failLower ? c : t));
+  }
+  return null;
+}
+
+/**
+ * Ranks with direct → SerpAPI fallback, then swaps any term that still has no data for the next list candidate.
+ */
+async function rankWithTermSubstitutions(
+  initialPicked: string[],
+  orderedCandidates: string[],
+  forcedDisplay: string | null,
+  puzzleId: string,
+): Promise<{ scores: Map<string, number>; finalPicked: string[] }> {
+  let current = [...initialPicked];
+  for (let sub = 0; sub < MAX_FAILED_TERM_SUBSTITUTIONS; sub++) {
+    try {
+      const scores = await rankFiveWithTransportAndFallback(current, puzzleId);
+      return { scores, finalPicked: current };
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (forcedDisplay && /interest data for term/i.test(err.message)) {
+        const m = err.message.match(/for term "([^"]+)"/i);
+        if (m?.[1] && m[1].toLowerCase() === forcedDisplay.toLowerCase()) {
+          throw new Error(
+            `Cannot rank forcedSeed "${forcedDisplay}": no complete interest for that query (Google and SerpAPI). Try another topicSeed. ${err.message}`,
+          );
+        }
+      }
+      const miss = parseFirstQuotedTermInMessage(err.message);
+      if (!miss) {
+        throw err;
+      }
+      const nxt = substituteOneFailedTerm(current, miss, orderedCandidates, forcedDisplay);
+      if (!nxt) {
+        throw err;
+      }
+      const diffI = current.findIndex((t, i) => t !== nxt[i]);
+      logStage({
+        stage: "swap_no_data_term",
+        puzzleId,
+        sub,
+        from: miss,
+        to: diffI >= 0 ? nxt[diffI] : "?",
+      });
+      current = nxt;
+    }
+  }
+  throw new Error("Exhausted term substitutions without a full ranking; broaden candidate list or set SERPAPI_KEY.");
 }
 
 function scoreSpread(scores: Map<string, number>): number {
@@ -818,13 +852,40 @@ export function deterministicPickFiveFromPool(
   return shuffled.slice(0, TREND_ITEMS_PER_PUZZLE);
 }
 
+export type GeneratedPuzzle = {
+  topicSeed: string;
+  sourceDate: string;
+  timeframe: string;
+  items: TrendItem[];
+  rankSource: string;
+  bqpRefreshDate: string;
+  regionKey: string;
+};
+
+function puzzleRankSource(): "bigquery" | "legacy" {
+  return String(process.env.PUZZLE_RANK_SOURCE || "legacy").trim().toLowerCase() === "bigquery" ? "bigquery" : "legacy";
+}
+
 export async function generateTrendPuzzle(options: {
   puzzleId: string;
   sourceDate?: string;
   forcedSeed?: string;
-}): Promise<{ topicSeed: string; sourceDate: string; timeframe: string; items: TrendItem[] }> {
+}): Promise<GeneratedPuzzle> {
+  if (puzzleRankSource() === "bigquery") {
+    const { runBigQueryPuzzle } = await import("./puzzle/orchestrate");
+    return runBigQueryPuzzle(options);
+  }
+  return generateTrendPuzzleLegacy(options);
+}
+
+async function generateTrendPuzzleLegacy(options: {
+  puzzleId: string;
+  sourceDate?: string;
+  forcedSeed?: string;
+}): Promise<GeneratedPuzzle> {
+  const { fetchDailyCandidates } = await import("./puzzle/candidates");
   const sourceDate = options.sourceDate || puzzleDateId(0);
-  const strategy = pickStrategy();
+  const strategy = getPuzzlePickStrategy();
   const t0 = Date.now();
 
   const candidates = await fetchDailyCandidates();
@@ -855,21 +916,16 @@ export async function generateTrendPuzzle(options: {
       throw err;
     }
 
+    const forcedDisplay = options.forcedSeed?.trim() ? sanitizeTerm(options.forcedSeed.trim()) : null;
+
     let scores: Map<string, number>;
+    let termsForOutput: string[];
     try {
-      scores = await rankFiveTermsStrict(pickedTerms);
+      const ranked = await rankWithTermSubstitutions(pickedTerms, candidates, forcedDisplay, options.puzzleId);
+      scores = ranked.scores;
+      termsForOutput = ranked.finalPicked;
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e));
-      const forcedS = options.forcedSeed?.trim() ? sanitizeTerm(options.forcedSeed.trim()) : null;
-      if (forcedS && /interest data for term/i.test(err.message)) {
-        const m = err.message.match(/for term "([^"]+)"/i);
-        const failTerm = m?.[1]?.toLowerCase();
-        if (failTerm === forcedS.toLowerCase()) {
-          throw new Error(
-            `Cannot rank forcedSeed: Google Trends returned incomplete interest for "${forcedS}". Try a different topicSeed, set TRENDS_ORIGIN to a working proxy, or TRENDS_FETCH_MODE=vendor with SERPAPI_KEY. Original: ${err.message}`,
-          );
-        }
-      }
       const canRetry = attempt < GENERATION_MAX_ATTEMPTS - 1;
       logStage({
         stage: "rank_failed",
@@ -892,7 +948,7 @@ export async function generateTrendPuzzle(options: {
     }
 
     const spread = scoreSpread(scores);
-    const sorted = [...pickedTerms].sort((a, b) => {
+    const sorted = [...termsForOutput].sort((a, b) => {
       const sa = scores.get(a) ?? 0;
       const sb = scores.get(b) ?? 0;
       if (sb !== sa) return sb - sa;
@@ -910,7 +966,7 @@ export async function generateTrendPuzzle(options: {
       puzzleId: options.puzzleId,
       attempt,
       strategy,
-      pickedTerms,
+      pickedTerms: termsForOutput,
       scoreSpread: spread,
       minScore: Math.min(...[...scores.values()]),
       maxScore: Math.max(...[...scores.values()]),
@@ -926,7 +982,15 @@ export async function generateTrendPuzzle(options: {
           scoreSpread: spread,
         });
       }
-      return { topicSeed, sourceDate, timeframe: FIXED_TIMEFRAME, items };
+      return {
+        topicSeed,
+        sourceDate,
+        timeframe: FIXED_TIMEFRAME,
+        items,
+        rankSource: "legacy:google_multiline_serp",
+        bqpRefreshDate: "",
+        regionKey: "US",
+      };
     }
 
     logStage({ stage: "low_spread_retry", puzzleId: options.puzzleId, attempt, scoreSpread: spread });

@@ -1,9 +1,20 @@
 import { type ClientSchema, a, defineData } from "@aws-amplify/backend";
 import { dailyTrends } from "../functions/daily-trends/resource";
-import { overrideTrendPuzzle } from "../functions/override-trend-puzzle/resource";
+import { regenerateDailyPuzzle } from "../functions/regenerate-daily-puzzle/resource";
 
 const schema = a
   .schema({
+    PuzzleOperationResult: a.customType({
+      ok: a.boolean().required(),
+      id: a.string(),
+      message: a.string(),
+      itemCount: a.integer(),
+      status: a.string(),
+      topicSeed: a.string(),
+      sourceDate: a.string(),
+      timeframe: a.string(),
+    }),
+
     DailyTrendPuzzle: a
       .model({
         id: a.id(),
@@ -14,6 +25,9 @@ const schema = a
         items: a.json(), // Array<{ term: string; rank: number; score?: number | null }>
         computeState: a.string(), // pending | ready | failed
         timeframe: a.string(), // now 1-d
+        rankSource: a.string(), // e.g. bigquery:international | legacy:google_multiline
+        bqpRefreshDate: a.string(), // YYYY-MM-DD partition used in BigQuery
+        regionKey: a.string(), // e.g. US | US:US-CA
       })
       .authorization((allow) => [allow.publicApiKey()]),
 
@@ -32,19 +46,19 @@ const schema = a
         allow.authenticated().to(["create", "read", "update"]),
       ]),
 
-    overrideTrendPuzzle: a
-      .query()
+    regenerateDailyPuzzle: a
+      .mutation()
       .arguments({
         id: a.string(),
         status: a.string(),
         topicSeed: a.string(),
         sourceDate: a.string(),
       })
-      .returns(a.json())
+      .returns(a.ref("PuzzleOperationResult"))
       .authorization((allow) => [allow.authenticated()])
-      .handler(a.handler.function(overrideTrendPuzzle)),
+      .handler(a.handler.function(regenerateDailyPuzzle)),
   })
-  .authorization((allow) => [allow.resource(dailyTrends), allow.resource(overrideTrendPuzzle)]);
+  .authorization((allow) => [allow.resource(dailyTrends), allow.resource(regenerateDailyPuzzle)]);
 
 export type Schema = ClientSchema<typeof schema>;
 

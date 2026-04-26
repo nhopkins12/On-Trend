@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@aws-amplify/ui-react": "^6.5.5",
+    "@google-cloud/bigquery": "^7.9.4",
     "an-array-of-english-words": "^2.0.0",
     "aws-amplify": "^6.6.6",
     "english-words": "^0.0.1",

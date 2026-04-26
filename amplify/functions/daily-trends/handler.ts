@@ -70,6 +70,9 @@ export const handler: EventBridgeHandler<"Scheduled Event", null, void> = async 
         sourceDate: generated.sourceDate,
         items: generated.items,
         timeframe: generated.timeframe,
+        rankSource: generated.rankSource,
+        bqpRefreshDate: generated.bqpRefreshDate,
+        regionKey: generated.regionKey,
         computeState: "ready",
       };
       logJson({ event: "puzzle_generated", puzzleId: tomorrowId, itemCount: generated.items.length });
@@ -85,6 +88,9 @@ export const handler: EventBridgeHandler<"Scheduled Event", null, void> = async 
         sourceDate: todayId,
         items: [],
         timeframe: "now 7-d",
+        rankSource: "",
+        bqpRefreshDate: "",
+        regionKey: "",
         computeState: "failed",
       };
     }

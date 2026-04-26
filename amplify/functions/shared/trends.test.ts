@@ -134,9 +134,11 @@ describe("puzzleDateId", () => {
   });
 });
 
-describe("rankFiveTermsStrict via generateTrendPuzzle", () => {
+describe("rankFiveTermsStrict via generateTrendPuzzle (legacy path)", () => {
   const prevFetch = globalThis.fetch;
   const prevStrategy = process.env.PUZZLE_PICK_STRATEGY;
+  const prevRank = process.env.PUZZLE_RANK_SOURCE;
+  const prevLegacyCands = process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE;
 
   afterEach(() => {
     globalThis.fetch = prevFetch as typeof fetch;
@@ -147,9 +149,21 @@ describe("rankFiveTermsStrict via generateTrendPuzzle", () => {
     } else {
       process.env.PUZZLE_PICK_STRATEGY = prevStrategy;
     }
+    if (prevRank === undefined) {
+      delete process.env.PUZZLE_RANK_SOURCE;
+    } else {
+      process.env.PUZZLE_RANK_SOURCE = prevRank;
+    }
+    if (prevLegacyCands === undefined) {
+      delete process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE;
+    } else {
+      process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE = prevLegacyCands;
+    }
   });
 
   it("throws when multiline returns no timeline (strict)", async () => {
+    process.env.PUZZLE_RANK_SOURCE = "legacy";
+    process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE = "1";
     process.env.TRENDS_FETCH_MODE = "direct";
     if (process.env.PUZZLE_PICK_STRATEGY === undefined) {
       // default is stratified
@@ -185,6 +199,6 @@ describe("rankFiveTermsStrict via generateTrendPuzzle", () => {
 
     await expect(
       generateTrendPuzzle({ puzzleId: "2026-04-24", sourceDate: "2026-04-24" }),
-    ).rejects.toThrow(/Incomplete Google Trends interest data/);
+    ).rejects.toThrow(/Incomplete Google Trends interest data|Exhausted term substitutions/);
   });
 });

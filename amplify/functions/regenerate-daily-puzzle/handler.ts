@@ -2,7 +2,7 @@ import type { Schema } from "../../data/resource";
 import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
-import { env } from "$amplify/env/override-trend-puzzle";
+import { env } from "$amplify/env/regenerate-daily-puzzle";
 import { deriveStatusForDate, generateTrendPuzzle, puzzleDateId } from "../shared/trends";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
@@ -12,17 +12,26 @@ const client = generateClient<Schema>();
 const authOptions = { authMode: "iam" as const };
 
 function logJson(payload: Record<string, unknown>) {
-  console.log(JSON.stringify({ source: "override-trend-puzzle", ...payload }));
+  console.log(JSON.stringify({ source: "regenerate-daily-puzzle", ...payload }));
 }
 
-export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (event) => {
+export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async (event) => {
   const id = String(event.arguments?.id || "").slice(0, 10);
   const requestedStatus = String(event.arguments?.status || "").toLowerCase();
   const topicSeed = String(event.arguments?.topicSeed || "").trim();
   const sourceDate = String(event.arguments?.sourceDate || puzzleDateId(0)).slice(0, 10);
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(id)) {
-    return { ok: false, message: "Invalid id format; expected YYYY-MM-DD" };
+    return {
+      ok: false,
+      id: "",
+      message: "Invalid id format; expected YYYY-MM-DD",
+      itemCount: 0,
+      status: "",
+      topicSeed: "",
+      sourceDate: "",
+      timeframe: "",
+    };
   }
 
   const todayId = puzzleDateId(0);
@@ -37,16 +46,22 @@ export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (
       sourceDate,
       forcedSeed: topicSeed || undefined,
     });
-  } catch (err: any) {
-    logJson({ event: "override_failed", id, message: err?.message || String(err) });
+  } catch (err: unknown) {
+    const m = err instanceof Error ? err.message : String(err);
+    logJson({ event: "regenerate_failed", id, message: m });
     return {
       ok: false,
-      message: `Failed generating trend puzzle: ${err?.message || "unknown error"}`,
+      message: `Failed generating trend puzzle: ${m}`,
       id,
+      itemCount: 0,
+      status: "",
+      topicSeed: "",
+      sourceDate: "",
+      timeframe: "",
     };
   }
 
-  const payload: any = {
+  const payload: Record<string, unknown> = {
     id,
     status,
     scope: "global",
@@ -54,13 +69,16 @@ export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (
     topicSeed: generated.topicSeed,
     items: generated.items,
     timeframe: generated.timeframe,
+    rankSource: generated.rankSource,
+    bqpRefreshDate: generated.bqpRefreshDate,
+    regionKey: generated.regionKey,
     computeState: "ready",
   };
 
   try {
-    await client.models.DailyTrendPuzzle.create(payload, authOptions);
+    await client.models.DailyTrendPuzzle.create(payload as any, authOptions);
   } catch {
-    await client.models.DailyTrendPuzzle.update(payload, authOptions);
+    await client.models.DailyTrendPuzzle.update(payload as any, authOptions);
   }
 
   if (status === "active" || status === "next") {
@@ -81,7 +99,7 @@ export const handler: Schema["overrideTrendPuzzle"]["functionHandler"] = async (
     }
   }
 
-  logJson({ event: "override_ok", id, status, itemCount: generated.items.length });
+  logJson({ event: "regenerate_ok", id, status, itemCount: generated.items.length });
   return {
     ok: true,
     id,
