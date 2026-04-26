@@ -4,12 +4,12 @@ export type TrendItem = {
   score: number | null;
 };
 
-/** IANA zone for a single app-wide “game day” (US Eastern, DST-aware). */
+/** IANA zone for a single app-wide "game day" (US Eastern, DST-aware). */
 const PUZZLE_TIME_ZONE = "America/New_York";
 export const TREND_ITEMS_PER_PUZZLE = 5;
-/** Minimum puzzle-friendly candidates before random draw (product spec). */
+/** Minimum puzzle-friendly candidates for legacy pick strategy. */
 export const MIN_PUZZLE_FRIENDLY_POOL = 10;
-/** Cap candidate pool size before shuffle (performance). */
+/** Cap candidate pool size for legacy shuffle (performance). */
 export const MAX_CANDIDATES_FOR_SAMPLE = 40;
 export const FIXED_TIMEFRAME = "now 7-d";
 const DAILY_RSS_GEOS = ["US"];
@@ -17,22 +17,26 @@ const SERPAPI_ENDPOINT = "https://serpapi.com/search.json";
 const SERPAPI_ENGINE = "google_trends";
 const SERPAPI_REGION = "US";
 
-const GENERIC_LOW_SIGNAL = new Set([
-  "becoming",
-  "today",
-  "tomorrow",
-  "yesterday",
-  "thing",
-  "things",
-  "story",
-  "stories",
-  "update",
-  "news",
-  "photo",
-  "video",
-  "challenge",
-  "mannequin challenge",
-]);
+/** Top of merged ordered list used for stratified index picks. */
+const STRATIFIED_HEAD_WINDOW = 30;
+/** Minimum ordered candidates (after merge) to attempt stratified pick. */
+const MIN_ORDERED_CANDIDATES = 5;
+/** Max pick attempts (rotation) when post-rank score spread is too flat. */
+const PICK_MAX_ATTEMPTS = 3;
+/**
+ * Min spread (max score − min) on 0–100 scale after ranking; if below, rotate indices and re-rank.
+ */
+const MIN_SCORE_SPREAD = 3.0;
+/** `stratified` (default) = list-anchored quintile pick; `legacy` = old shuffle pool. */
+const pickStrategy = (): "stratified" | "legacy" =>
+  String(process.env.PUZZLE_PICK_STRATEGY || "stratified")
+    .trim()
+    .toLowerCase() === "legacy"
+    ? "legacy"
+    : "stratified";
+/** Per-HTTP `fetch` timeout (ms) so Lambda does not hang on Trends. */
+const FETCH_TIMEOUT_MS = Math.min(90_000, Math.max(5_000, Number(process.env.TRENDS_FETCH_TIMEOUT_MS) || 25_000));
+
 const PUZZLE_NOISE_PATTERNS = [
   /\bupdate\b/i,
   /\blive\b/i,
@@ -96,6 +100,10 @@ const NON_NOUN_TOKENS = new Set([
   "lose",
   "lost",
 ]);
+
+function logStage(payload: Record<string, unknown>) {
+  console.log(JSON.stringify({ source: "trends.generateTrendPuzzle", ...payload }));
+}
 
 function stripXssi(text: string): string {
   return text.replace(/^\)\]\}',?\n/, "");
@@ -166,6 +174,15 @@ function deterministicShuffle<T>(items: T[], seedKey: string): T[] {
   return copy;
 }
 
+function fetchSignal(ms: number): AbortSignal {
+  if (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal) {
+    return AbortSignal.timeout(ms);
+  }
+  const c = new AbortController();
+  setTimeout(() => c.abort(), ms);
+  return c.signal;
+}
+
 /** Google Trends host or your reverse proxy origin (no trailing slash). */
 function trendsOrigin(): string {
   return (process.env.TRENDS_ORIGIN || "https://trends.google.com").replace(/\/$/, "");
@@ -188,22 +205,6 @@ export function sanitizeTerm(input: string): string | null {
   return cleaned;
 }
 
-function isLikelyLowSignal(term: string, score: number): boolean {
-  const normalized = term.toLowerCase();
-  if (GENERIC_LOW_SIGNAL.has(normalized) && score < 90) return true;
-
-  const words = normalized.split(/\s+/).filter(Boolean);
-  const isSingleWord = words.length === 1;
-  const hasDigit = /\d/.test(term);
-  const isAcronym = /^[A-Z]{2,6}$/.test(term);
-
-  if (hasDigit || isAcronym) return score < 30;
-  if (isSingleWord && /^[a-z]+$/.test(normalized) && score < 55) return true;
-  if (normalized.length <= 4 && score < 50) return true;
-
-  return false;
-}
-
 export function isPuzzleFriendlyTerm(term: string): boolean {
   const normalized = String(term || "").trim();
   if (!normalized) return false;
@@ -221,6 +222,168 @@ export function isPuzzleFriendlyTerm(term: string): boolean {
   return true;
 }
 
+/** Relaxed: same length/word/noise rules; allows verb-like tokens (for thin days). */
+export function isPuzzleAcceptableLoose(term: string): boolean {
+  const normalized = String(term || "").trim();
+  if (!normalized) return false;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length > 5) return false;
+  if (normalized.length > 48) return false;
+  if (PUZZLE_NOISE_PATTERNS.some((p) => p.test(normalized))) return false;
+  return true;
+}
+
+/**
+ * US dailytrends first (order preserved, dedupe by first occurrence), then RSS-only extras in RSS order.
+ */
+export function mergeOrderedUnique(legacyOrdered: string[], rssOrdered: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const t of legacyOrdered) {
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  for (const t of rssOrdered) {
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
+/**
+ * One term per fifth of `window` (0..4), with rotation by hash + `attempt` so retries pick a different set.
+ * Indices are unique where possible; uses offsets within each fifth if collision.
+ */
+export function pickQuintileIndices(
+  windowLen: number,
+  puzzleId: string,
+  attempt: number,
+): number[] {
+  const W = Math.max(0, windowLen);
+  if (W === 0) return [];
+  const h = hashString(`${puzzleId}:quintile:${attempt}`);
+  const out: number[] = [];
+  const used = new Set<number>();
+
+  for (let q = 0; q < 5; q++) {
+    const start = Math.floor((q * W) / 5);
+    const end = Math.max(start, Math.floor(((q + 1) * W) / 5) - 1);
+    const segLen = end - start + 1;
+    for (let k = 0; k < segLen; k++) {
+      const j = (start + ((h >>> (q * 3 + k * 7)) + k + q * 11) % segLen) % W;
+      if (!used.has(j)) {
+        used.add(j);
+        out.push(j);
+        break;
+      }
+    }
+    if (out.length === q) {
+      for (let j = start; j <= end && out.length < q + 1; j++) {
+        if (!used.has(j)) {
+          used.add(j);
+          out.push(j);
+          break;
+        }
+      }
+    }
+  }
+  if (out.length < 5) {
+    for (let j = 0; j < W && out.length < 5; j++) {
+      if (!used.has(j)) {
+        used.add(j);
+        out.push(j);
+      }
+    }
+  }
+  return out.slice(0, 5);
+}
+
+/**
+ * Picks 5 from ordered list: quintile in head window, then walk ordered for strict, then loose.
+ */
+export function pickFiveStratified(
+  orderedFull: string[],
+  puzzleId: string,
+  attempt: number,
+  forcedSeed?: string,
+): string[] {
+  if (orderedFull.length < MIN_ORDERED_CANDIDATES) {
+    throw new Error(
+      `Need at least ${MIN_ORDERED_CANDIDATES} ordered candidates after merge, got ${orderedFull.length}`,
+    );
+  }
+
+  const window = Math.min(STRATIFIED_HEAD_WINDOW, orderedFull.length);
+  const head = orderedFull.slice(0, window);
+  const forced = forcedSeed?.trim() ? sanitizeTerm(forcedSeed.trim()) : null;
+
+  if (forced) {
+    if (!isPuzzleAcceptableLoose(forced)) {
+      throw new Error("forcedSeed failed loose puzzle checks");
+    }
+    const fLower = forced.toLowerCase();
+    const rest = orderedFull.filter((t) => t.toLowerCase() !== fLower);
+    if (rest.length < TREND_ITEMS_PER_PUZZLE - 1) {
+      throw new Error("Not enough candidates to combine with forcedSeed");
+    }
+    const restWindow = rest.slice(0, Math.min(STRATIFIED_HEAD_WINDOW, rest.length));
+    const wlen = restWindow.length;
+    const idxs = pickQuintileIndices(wlen, puzzleId, attempt + 1);
+    const picked: string[] = [forced];
+    for (const i of idxs) {
+      if (picked.length >= TREND_ITEMS_PER_PUZZLE) break;
+      const t = restWindow[i];
+      if (t && !picked.some((p) => p.toLowerCase() === t.toLowerCase())) {
+        picked.push(t);
+      }
+    }
+    return fillPickedFromOrdered(orderedFull, picked, puzzleId, attempt);
+  }
+
+  const idxs = pickQuintileIndices(window, puzzleId, attempt);
+  const raw = idxs.map((i) => head[i]).filter(Boolean);
+  return fillPickedFromOrdered(orderedFull, raw, puzzleId, attempt);
+}
+
+function fillPickedFromOrdered(orderedFull: string[], start: string[], puzzleId: string, attempt: number): string[] {
+  const out: string[] = [];
+  const have = (t: string) => out.some((x) => x.toLowerCase() === t.toLowerCase());
+  for (const t of start) {
+    if (t && !have(t) && isPuzzleFriendlyTerm(t)) out.push(t);
+  }
+  for (const t of start) {
+    if (out.length >= TREND_ITEMS_PER_PUZZLE) break;
+    if (t && !have(t) && isPuzzleAcceptableLoose(t)) out.push(t);
+  }
+  for (const t of orderedFull) {
+    if (out.length >= TREND_ITEMS_PER_PUZZLE) break;
+    if (have(t)) continue;
+    if (isPuzzleFriendlyTerm(t)) out.push(t);
+  }
+  for (const t of orderedFull) {
+    if (out.length >= TREND_ITEMS_PER_PUZZLE) break;
+    if (have(t)) continue;
+    if (isPuzzleAcceptableLoose(t)) out.push(t);
+  }
+  for (const t of orderedFull) {
+    if (out.length >= TREND_ITEMS_PER_PUZZLE) break;
+    const s = sanitizeTerm(t);
+    if (s && isPuzzleAcceptableLoose(s) && !have(s)) out.push(s);
+  }
+  if (out.length < TREND_ITEMS_PER_PUZZLE) {
+    throw new Error(
+      `Stratified pick: could not find ${TREND_ITEMS_PER_PUZZLE} displayable terms (got ${out.length}) for puzzleId=${puzzleId} attempt=${attempt}`,
+    );
+  }
+  return out.slice(0, TREND_ITEMS_PER_PUZZLE);
+}
+
 async function fetchText(url: string): Promise<string> {
   const maxAttempts = 3;
   let lastError: unknown = null;
@@ -233,6 +396,7 @@ async function fetchText(url: string): Promise<string> {
           "User-Agent": "Mozilla/5.0",
           "Accept-Language": "en-US,en;q=0.9",
         },
+        signal: fetchSignal(FETCH_TIMEOUT_MS),
       });
 
       if (response.ok) {
@@ -263,36 +427,70 @@ async function fetchJson(url: string): Promise<any> {
   return JSON.parse(txt);
 }
 
-function parseDailyRssTitles(xmlText: string): string[] {
+function parseDailyRssTitlesOrdered(xmlText: string): string[] {
   const out: string[] = [];
+  const seen = new Set<string>();
   const itemMatches = xmlText.match(/<item>[\s\S]*?<\/item>/g) || [];
 
   for (const block of itemMatches) {
     const titleMatch = block.match(/<title>([\s\S]*?)<\/title>/i);
     if (!titleMatch?.[1]) continue;
     const clean = sanitizeTerm(decodeXmlEntities(titleMatch[1]));
-    if (clean) out.push(clean);
+    if (clean) {
+      const k = clean.toLowerCase();
+      if (!seen.has(k)) {
+        seen.add(k);
+        out.push(clean);
+      }
+    }
   }
-
-  return Array.from(new Set(out));
+  return out;
 }
 
-async function fetchRssDailyCandidates(): Promise<string[]> {
+async function fetchRssDailyOrdered(): Promise<string[]> {
   const merged: string[] = [];
   for (const geo of DAILY_RSS_GEOS) {
     try {
       const txt = await fetchText(
         trendsUrl(`/trending/rss?geo=${encodeURIComponent(geo)}`),
       );
-      merged.push(...parseDailyRssTitles(txt));
+      merged.push(...parseDailyRssTitlesOrdered(txt));
     } catch {
       // no-op
     }
   }
-  return Array.from(new Set(merged));
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+  for (const t of merged) {
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    ordered.push(t);
+  }
+  return ordered;
 }
 
-async function fetchLegacyDailyCandidates(): Promise<string[]> {
+/**
+ * Preserves Google dailytrends `trendingSearches` order; dedupes by first occurrence (case-insensitive).
+ */
+function parseLegacyDailyListOrderedFromPayload(payload: any): string[] {
+  const latestDay = payload?.default?.trendingSearchesDays?.[0];
+  const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of list) {
+    const clean = sanitizeTerm(entry?.title?.query);
+    if (clean) {
+      const k = clean.toLowerCase();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+async function fetchLegacyDailyCandidatesOrdered(): Promise<string[]> {
   const urls = [
     "/trends/api/dailytrends?hl=en-US&tz=0&geo=US&ns=15",
     "/trends/api/dailytrends?hl=en-US&tz=0&geo=&ns=15",
@@ -302,29 +500,20 @@ async function fetchLegacyDailyCandidates(): Promise<string[]> {
     try {
       const txt = await fetchText(trendsUrl(path));
       const payload = JSON.parse(stripXssi(txt));
-      const latestDay = payload?.default?.trendingSearchesDays?.[0];
-      const list = Array.isArray(latestDay?.trendingSearches) ? latestDay.trendingSearches : [];
-      const out: string[] = [];
-      for (const entry of list) {
-        const clean = sanitizeTerm(entry?.title?.query);
-        if (clean) out.push(clean);
-      }
-      const unique = Array.from(new Set(out));
-      if (unique.length) return unique;
+      const out = parseLegacyDailyListOrderedFromPayload(payload);
+      if (out.length) return out;
     } catch {
       // try next variant
     }
   }
-
   return [];
 }
 
 async function fetchDailyCandidates(): Promise<string[]> {
-  const legacy = await fetchLegacyDailyCandidates();
-  const rss = await fetchRssDailyCandidates();
-  const merged = Array.from(new Set([...legacy, ...rss]));
+  const legacy = await fetchLegacyDailyCandidatesOrdered();
+  const rss = await fetchRssDailyOrdered();
+  const merged = mergeOrderedUnique(legacy, rss);
   if (merged.length) return merged;
-
   throw new Error("No candidates available from Google Trends sources.");
 }
 
@@ -583,9 +772,16 @@ async function rankFiveTermsStrict(terms: string[]): Promise<Map<string, number>
   return out;
 }
 
+function scoreSpread(scores: Map<string, number>): number {
+  const vals = [...scores.values()];
+  if (vals.length < 2) return 0;
+  return Math.max(...vals) - Math.min(...vals);
+}
+
 /**
  * Uniform random five (deterministic by seedKey): shuffle capped pool, take first five.
  * If forcedSeed is set and puzzle-friendly, it is always included and the other four are drawn from the rest.
+ * Used when PUZZLE_PICK_STRATEGY=legacy.
  */
 export function deterministicPickFiveFromPool(
   puzzleFriendly: string[],
@@ -598,7 +794,7 @@ export function deterministicPickFiveFromPool(
     );
   }
 
-  let pool = puzzleFriendly.slice(0, MAX_CANDIDATES_FOR_SAMPLE);
+  const pool = puzzleFriendly.slice(0, MAX_CANDIDATES_FOR_SAMPLE);
   const forcedRaw = forcedSeed?.trim() ? sanitizeTerm(forcedSeed.trim()) : null;
 
   if (forcedRaw) {
@@ -625,37 +821,95 @@ export async function generateTrendPuzzle(options: {
   forcedSeed?: string;
 }): Promise<{ topicSeed: string; sourceDate: string; timeframe: string; items: TrendItem[] }> {
   const sourceDate = options.sourceDate || puzzleDateId(0);
+  const strategy = pickStrategy();
+  const t0 = Date.now();
+
   const candidates = await fetchDailyCandidates();
-  const puzzleFriendlyCandidates = candidates.filter((x) => isPuzzleFriendlyTerm(x));
-
-  const pickedTerms = deterministicPickFiveFromPool(
-    puzzleFriendlyCandidates,
-    options.puzzleId,
-    options.forcedSeed,
-  );
-
-  const scores = await rankFiveTermsStrict(pickedTerms);
-  const sorted = [...pickedTerms].sort((a, b) => {
-    const sa = scores.get(a) ?? 0;
-    const sb = scores.get(b) ?? 0;
-    if (sb !== sa) return sb - sa;
-    return a.localeCompare(b);
+  logStage({
+    stage: "candidates_fetched",
+    puzzleId: options.puzzleId,
+    strategy,
+    rawCount: candidates.length,
+    headPreview: candidates.slice(0, 5),
   });
 
-  const items: TrendItem[] = sorted.map((term, idx) => ({
-    term,
-    rank: idx + 1,
-    score: scores.get(term) ?? null,
-  }));
+  for (let attempt = 0; attempt < PICK_MAX_ATTEMPTS; attempt++) {
+    let pickedTerms: string[];
+    try {
+      if (strategy === "legacy") {
+        const puzzleFriendlyCandidates = candidates.filter((x) => isPuzzleFriendlyTerm(x));
+        pickedTerms = deterministicPickFiveFromPool(
+          puzzleFriendlyCandidates,
+          `${options.puzzleId}:lowSpreadRetry:${attempt}`,
+          options.forcedSeed,
+        );
+      } else {
+        pickedTerms = pickFiveStratified(candidates, options.puzzleId, attempt, options.forcedSeed);
+      }
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      logStage({ stage: "pick_failed", puzzleId: options.puzzleId, attempt, error: err.message });
+      throw err;
+    }
 
-  const topicSeed = options.forcedSeed?.trim() ? String(sanitizeTerm(options.forcedSeed.trim()) || "") : "";
+    let scores: Map<string, number>;
+    try {
+      scores = await rankFiveTermsStrict(pickedTerms);
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      logStage({
+        stage: "rank_failed",
+        puzzleId: options.puzzleId,
+        attempt,
+        pickedTerms,
+        error: err.message,
+        ms: Date.now() - t0,
+      });
+      throw err;
+    }
 
-  return {
-    topicSeed,
-    sourceDate,
-    timeframe: FIXED_TIMEFRAME,
-    items,
-  };
+    const spread = scoreSpread(scores);
+    const sorted = [...pickedTerms].sort((a, b) => {
+      const sa = scores.get(a) ?? 0;
+      const sb = scores.get(b) ?? 0;
+      if (sb !== sa) return sb - sa;
+      return a.localeCompare(b);
+    });
+    const items: TrendItem[] = sorted.map((term, idx) => ({
+      term,
+      rank: idx + 1,
+      score: scores.get(term) ?? null,
+    }));
+    const topicSeed = options.forcedSeed?.trim() ? String(sanitizeTerm(options.forcedSeed.trim()) || "") : "";
+
+    logStage({
+      stage: "rank_ok",
+      puzzleId: options.puzzleId,
+      attempt,
+      strategy,
+      pickedTerms,
+      scoreSpread: spread,
+      minScore: Math.min(...[...scores.values()]),
+      maxScore: Math.max(...[...scores.values()]),
+      ms: Date.now() - t0,
+    });
+
+    if (spread >= MIN_SCORE_SPREAD || attempt === PICK_MAX_ATTEMPTS - 1) {
+      if (spread < MIN_SCORE_SPREAD) {
+        logStage({
+          stage: "low_spread_accepted",
+          puzzleId: options.puzzleId,
+          attempt,
+          scoreSpread: spread,
+        });
+      }
+      return { topicSeed, sourceDate, timeframe: FIXED_TIMEFRAME, items };
+    }
+
+    logStage({ stage: "low_spread_retry", puzzleId: options.puzzleId, attempt, scoreSpread: spread });
+  }
+
+  throw new Error("generateTrendPuzzle: exhausted pick attempts");
 }
 
 export function deriveStatusForDate(id: string, todayId: string): "archived" | "active" | "next" {

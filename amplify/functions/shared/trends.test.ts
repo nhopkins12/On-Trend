@@ -1,11 +1,77 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   deterministicPickFiveFromPool,
   generateTrendPuzzle,
+  isPuzzleAcceptableLoose,
+  isPuzzleFriendlyTerm,
+  mergeOrderedUnique,
   MIN_PUZZLE_FRIENDLY_POOL,
+  pickFiveStratified,
+  pickQuintileIndices,
   puzzleDateId,
   sanitizeTerm,
 } from "./trends";
+
+describe("mergeOrderedUnique", () => {
+  it("keeps legacy order and appends RSS-only terms", () => {
+    const merged = mergeOrderedUnique(["A", "B", "C"], ["B", "D", "E"]);
+    expect(merged).toEqual(["A", "B", "C", "D", "E"]);
+  });
+});
+
+describe("pickQuintileIndices", () => {
+  it("returns 5 indices in range for W >= 5", () => {
+    const idx = pickQuintileIndices(20, "pid", 0);
+    expect(idx).toHaveLength(5);
+    for (const j of idx) {
+      expect(j).toBeGreaterThanOrEqual(0);
+      expect(j).toBeLessThan(20);
+    }
+  });
+
+  it("is deterministic for the same inputs", () => {
+    const a = pickQuintileIndices(30, "x", 1);
+    const b = pickQuintileIndices(30, "x", 1);
+    expect(a).toEqual(b);
+  });
+
+  it("varies with attempt", () => {
+    const a = pickQuintileIndices(30, "pid", 0);
+    const b = pickQuintileIndices(30, "pid", 1);
+    expect(a).not.toEqual(b);
+  });
+});
+
+describe("pickFiveStratified", () => {
+  const makeOrdered = (n: number) =>
+    Array.from({ length: n }, (_, i) => {
+      if (i % 3 === 0) {
+        return `Event News ${i}`;
+      }
+      return `Story Topic ${i}`;
+    });
+
+  it("returns 5 terms", () => {
+    const ordered = makeOrdered(15);
+    const out = pickFiveStratified(ordered, "2026-04-30", 0);
+    expect(out).toHaveLength(5);
+  });
+
+  it("is stable for a fixed puzzleId and attempt", () => {
+    const ordered = makeOrdered(20);
+    const a = pickFiveStratified(ordered, "puzzle-1", 0);
+    const b = pickFiveStratified(ordered, "puzzle-1", 0);
+    expect(a).toEqual(b);
+  });
+});
+
+describe("two-tier acceptability", () => {
+  it("rejects more than loose when isPuzzleFriendly is false", () => {
+    const t = "is running late";
+    expect(isPuzzleFriendlyTerm(t)).toBe(false);
+    expect(isPuzzleAcceptableLoose("running late event")).toBe(true);
+  });
+});
 
 describe("deterministicPickFiveFromPool", () => {
   const pool = Array.from({ length: MIN_PUZZLE_FRIENDLY_POOL + 2 }, (_, i) => `StableWord${i}`);
@@ -70,15 +136,24 @@ describe("puzzleDateId", () => {
 
 describe("rankFiveTermsStrict via generateTrendPuzzle", () => {
   const prevFetch = globalThis.fetch;
+  const prevStrategy = process.env.PUZZLE_PICK_STRATEGY;
 
   afterEach(() => {
     globalThis.fetch = prevFetch as typeof fetch;
     delete process.env.TRENDS_FETCH_MODE;
     delete process.env.SERPAPI_KEY;
+    if (prevStrategy === undefined) {
+      delete process.env.PUZZLE_PICK_STRATEGY;
+    } else {
+      process.env.PUZZLE_PICK_STRATEGY = prevStrategy;
+    }
   });
 
   it("throws when multiline returns no timeline (strict)", async () => {
     process.env.TRENDS_FETCH_MODE = "direct";
+    if (process.env.PUZZLE_PICK_STRATEGY === undefined) {
+      // default is stratified
+    }
     globalThis.fetch = vi.fn(async (url: string | URL) => {
       const u = String(url);
       if (u.includes("/trends/api/dailytrends")) {

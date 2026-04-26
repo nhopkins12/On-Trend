@@ -78,6 +78,17 @@ function todayPuzzleDateId() {
 const TOTAL_ITEMS = 5;
 const DEFAULT_TIMEFRAME = "now 7-d";
 
+/** Set `VITE_MOCK_PUZZLE=1` in `.env` / `.env.local` to play without AppSync (UI / layout only). */
+const MOCK_PUZZLE_ENABLED = import.meta.env.VITE_MOCK_PUZZLE === "1";
+
+const DEV_MOCK_ITEMS = [
+  { term: "Generative AI", rank: 1, score: 100 },
+  { term: "Electric vehicles", rank: 2, score: 86 },
+  { term: "Championship final", rank: 3, score: 72 },
+  { term: "Box office", rank: 4, score: 58 },
+  { term: "Music awards", rank: 5, score: 44 },
+];
+
 function sortEntries(entries) {
   return [...entries].sort((a, b) => {
     const am = a?.mistakes ?? 99;
@@ -97,6 +108,8 @@ export default function OnTrendsGame() {
   const [puzzleCloudState, setPuzzleCloudState] = useState("loading");
   const [puzzleError, setPuzzleError] = useState("");
   const [puzzleRetryTick, setPuzzleRetryTick] = useState(0);
+  /** Dev-only: shows when using mock or latest-ready fallback. */
+  const [devPuzzleNote, setDevPuzzleNote] = useState("");
 
   const [puzzleId, setPuzzleId] = useState("");
   const [topicSeed, setTopicSeed] = useState("");
@@ -166,7 +179,19 @@ export default function OnTrendsGame() {
   const loadTodayPuzzle = useCallback(async () => {
     setPuzzleCloudState("loading");
     setPuzzleError("");
+    setDevPuzzleNote("");
     const todayId = todayPuzzleDateId();
+
+    if (MOCK_PUZZLE_ENABLED) {
+      setPuzzleCloudState("ready");
+      setPuzzleId(todayId);
+      setTopicSeed("");
+      setTimeframe(DEFAULT_TIMEFRAME);
+      setOrderedItems(DEV_MOCK_ITEMS);
+      setDevPuzzleNote("Mock puzzle (VITE_MOCK_PUZZLE=1) — not loaded from the cloud.");
+      initializeGame(DEV_MOCK_ITEMS, todayId);
+      return;
+    }
 
     try {
       const client = generateClient();
@@ -179,6 +204,38 @@ export default function OnTrendsGame() {
       }
 
       if (!data) {
+        if (import.meta.env.DEV) {
+          try {
+            const { data: listData, errors: listErrors } = await client.models.DailyTrendPuzzle.list();
+            if (!listErrors?.length && Array.isArray(listData)) {
+              const ready = listData
+                .filter(
+                  (x) =>
+                    x &&
+                    String(x.computeState || "").toLowerCase() === "ready" &&
+                    parseItems(x.items).length === TOTAL_ITEMS,
+                )
+                .sort((a, b) => String(b.id || "").localeCompare(String(a.id || "")));
+              const row = ready[0];
+              if (row) {
+                const parsedItems = parseItems(row.items);
+                const pid = String(row.id);
+                setPuzzleCloudState("ready");
+                setPuzzleId(pid);
+                setTopicSeed(String(row.topicSeed || ""));
+                setTimeframe(String(row.timeframe || DEFAULT_TIMEFRAME));
+                setOrderedItems(parsedItems);
+                setDevPuzzleNote(
+                  `Dev fallback: no row for ${todayId} — using latest ready puzzle (${pid}) from your backend.`,
+                );
+                initializeGame(parsedItems, pid);
+                return;
+              }
+            }
+          } catch (fallbackErr) {
+            console.warn("Dev fallback: list latest ready failed", fallbackErr);
+          }
+        }
         setPuzzleCloudState("missing");
         setPuzzleError(
           "No puzzle row for today yet. After deployment, the scheduled job writes the next day’s puzzle; today’s row may still be empty.",
@@ -232,6 +289,12 @@ export default function OnTrendsGame() {
 
   const fetchLeaderboard = useCallback(async (pid) => {
     if (!pid || puzzleCloudState !== "ready") return;
+    if (MOCK_PUZZLE_ENABLED) {
+      setLeaderboardLoading(false);
+      setLeaderboard([]);
+      setLeaderboardError("");
+      return;
+    }
     setLeaderboardLoading(true);
     setLeaderboardError("");
     try {
@@ -562,6 +625,18 @@ export default function OnTrendsGame() {
           <div className="mb-8 rounded-xl border border-red-200 bg-red-50 p-6 text-center">
             <h2 className="text-lg font-semibold text-red-900">Could not load puzzle</h2>
             <p className="text-sm text-red-800 mt-2 whitespace-pre-wrap">{puzzleError}</p>
+            {import.meta.env.DEV ? (
+              <p className="text-sm text-amber-900 mt-4 text-left max-w-md mx-auto">
+                <strong>Local dev:</strong> add{" "}
+                <code className="bg-amber-100 px-1 rounded">VITE_MOCK_PUZZLE=1</code> to{" "}
+                <code className="bg-amber-100 px-1 rounded">.env.local</code> (or{" "}
+                <code className="bg-amber-100 px-1 rounded">.env</code>) and restart{" "}
+                <code className="bg-amber-100 px-1 rounded">npm run dev</code> for a mock grid without AppSync. For real
+                data, run <code className="bg-amber-100 px-1 rounded">npx ampx sandbox</code> and keep{" "}
+                <code className="bg-amber-100 px-1 rounded">amplify_outputs.json</code> in sync, or create a{" "}
+                <code className="bg-amber-100 px-1 rounded">DailyTrendPuzzle</code> row for today in the backend.
+              </p>
+            ) : null}
             <button
               type="button"
               onClick={() => setPuzzleRetryTick((n) => n + 1)}
@@ -575,6 +650,11 @@ export default function OnTrendsGame() {
         <header className="text-center mb-12">
           <h1 className="text-4xl font-bold text-black tracking-tight">On Trends</h1>
           <p className="text-gray-600 mt-2">Drag each incoming trend into the correct global ranking position.</p>
+          {devPuzzleNote ? (
+            <p className="text-sm text-amber-800 mt-3 inline-block max-w-lg px-3 py-2 rounded-lg bg-amber-50 border border-amber-200">
+              {devPuzzleNote}
+            </p>
+          ) : null}
           {topicSeed ? <p className="text-sm text-gray-500 mt-1">Seed: {topicSeed}</p> : null}
           <p className="text-xs text-gray-400 mt-1">Window: {timeframe}</p>
           {puzzleId ? <p className="text-xs text-gray-400 mt-1">Puzzle {puzzleId}</p> : null}
