@@ -5,6 +5,7 @@ import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
 import { env } from "$amplify/env/daily-trends";
+import { isPuzzleReadyForPlay } from "../shared/puzzle/persist-puzzle";
 import { generateTrendPuzzle, puzzleDateId } from "../shared/trends";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
@@ -51,7 +52,7 @@ export const handler: EventBridgeHandler<"Scheduled Event", null, void> = async 
 
   try {
     const { data: existing } = await client.models.DailyTrendPuzzle.get({ id: tomorrowId }, authOptions);
-    if (existing && existing.computeState === "ready" && existing.status === "next") {
+    if (existing?.status === "next" && isPuzzleReadyForPlay(existing)) {
       return;
     }
 

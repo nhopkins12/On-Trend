@@ -55,6 +55,77 @@ function sanitizeTableId(table: string): string {
   return t;
 }
 
+const DEFAULT_BQ_TOP_LIMIT = 100;
+
+/**
+ * All distinct top terms for the partition (best rank first), for building a pick pool that
+ * only contains terms that exist in the public dataset (avoids BQ join failures after random RSS picks).
+ */
+export async function listBqTopTermsForDate(bqpRefreshDate: string, limit = DEFAULT_BQ_TOP_LIMIT): Promise<string[]> {
+  const bq = await getBigQuery();
+  const table = sanitizeTableId(
+    String(process.env.PUZZLE_BQ_TABLE || "bigquery-public-data.google_trends.international_top_terms"),
+  );
+  const country = String(process.env.PUZZLE_BQ_COUNTRY || "US").trim();
+  const jobLocation = String(process.env.PUZZLE_BQ_LOCATION || "US").trim();
+  const regionName = String(process.env.PUZZLE_BQ_REGION_NAME || "").trim();
+
+  const query = regionName
+    ? `
+    WITH ranked AS (
+      SELECT
+        LOWER(TRIM(t.term)) AS k,
+        ANY_VALUE(t.term) AS display_term,
+        MIN(t.rank) AS best_rank
+      FROM \`${table}\` AS t
+      WHERE t.refresh_date = @refreshDate
+        AND t.country_code = @country
+        AND t.region_name = @regionName
+      GROUP BY k
+    )
+    SELECT display_term AS term
+    FROM ranked
+    ORDER BY best_rank ASC
+    LIMIT @lim
+  `
+    : `
+    WITH ranked AS (
+      SELECT
+        LOWER(TRIM(t.term)) AS k,
+        ANY_VALUE(t.term) AS display_term,
+        MIN(t.rank) AS best_rank
+      FROM \`${table}\` AS t
+      WHERE t.refresh_date = @refreshDate
+        AND t.country_code = @country
+      GROUP BY k
+    )
+    SELECT display_term AS term
+    FROM ranked
+    ORDER BY best_rank ASC
+    LIMIT @lim
+  `;
+
+  const [rows] = await bq.query({
+    query: query.replace(/\s+/g, " ").trim(),
+    location: jobLocation,
+    params: regionName
+      ? { refreshDate: bqpRefreshDate, country, regionName, lim: limit }
+      : { refreshDate: bqpRefreshDate, country, lim: limit },
+  });
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const row of rows as { term?: string }[]) {
+    const t = row?.term == null ? "" : String(row.term).trim();
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
 /**
  * Fetches BQ `rank` (1 = highest in top 25) and `score` for the given display terms
  * in `international_top_terms` (or override `PUZZLE_BQ_TABLE`) for a country, grouped

@@ -9,8 +9,17 @@ import {
 
 const DAILY_RSS_GEOS = ["US"];
 
+/**
+ * When unset: `legacy` rank source includes dailytrends (matches old merge behavior);
+ * `bigquery` rank source excludes it so picks align with BQ top terms + RSS/curated only.
+ * Override with CANDIDATE_INCLUDE_LEGACY_GOOGLE=1|0|true|false.
+ */
 function includeLegacyGoogleList(): boolean {
-  return String(process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE || "0").trim() === "1";
+  const raw = String(process.env.CANDIDATE_INCLUDE_LEGACY_GOOGLE ?? "").trim().toLowerCase();
+  if (raw === "1" || raw === "true" || raw === "yes") return true;
+  if (raw === "0" || raw === "false" || raw === "no") return false;
+  const rank = String(process.env.PUZZLE_RANK_SOURCE || "legacy").trim().toLowerCase();
+  return rank !== "bigquery";
 }
 
 /** Comma- or semicolon-separated terms; listed first in merge order. */

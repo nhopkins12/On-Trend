@@ -6,6 +6,6 @@ export const dailyTrends = defineFunction({
   entry: "./handler.ts",
   // Default Amplify function timeout is 3s — puzzle generation needs many sequential
   // HTTP calls to Google Trends (and optional SerpAPI), so it will time out otherwise.
-  timeoutSeconds: 180,
-  memoryMB: 512,
+  timeoutSeconds: 900,
+  memoryMB: 1024,
 });

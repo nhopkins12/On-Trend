@@ -19,7 +19,7 @@ const SERPAPI_REGION = "US";
 /** Top of merged ordered list used for stratified index picks. */
 const STRATIFIED_HEAD_WINDOW = 30;
 /** Minimum ordered candidates (after merge) to attempt stratified pick. */
-const MIN_ORDERED_CANDIDATES = 5;
+export const MIN_ORDERED_CANDIDATES = 5;
 /**
  * Max full pick+rank cycles: low score spread, incomplete interest data (e.g. niche / one-word queries),
  * or transient Google empty timeline — each retry advances `attempt` so quintile / shuffle selection changes.

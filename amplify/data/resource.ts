@@ -4,15 +4,9 @@ import { regenerateDailyPuzzle } from "../functions/regenerate-daily-puzzle/reso
 
 const schema = a
   .schema({
-    PuzzleOperationResult: a.customType({
-      ok: a.boolean().required(),
-      id: a.string(),
-      message: a.string(),
-      itemCount: a.integer(),
-      status: a.string(),
-      topicSeed: a.string(),
-      sourceDate: a.string(),
-      timeframe: a.string(),
+    /** GraphQL return for `regenerateDailyPuzzle` (async: job accepted, not the puzzle payload). */
+    RegenerateDailyPuzzleResult: a.customType({
+      success: a.boolean().required(),
     }),
 
     DailyTrendPuzzle: a
@@ -54,9 +48,10 @@ const schema = a
         topicSeed: a.string(),
         sourceDate: a.string(),
       })
-      .returns(a.ref("PuzzleOperationResult"))
+      .returns(a.ref("RegenerateDailyPuzzleResult"))
       .authorization((allow) => [allow.authenticated()])
-      .handler(a.handler.function(regenerateDailyPuzzle)),
+      // Async invocation: AppSync returns immediately; Lambda can run up to timeout (see resource.ts).
+      .handler(a.handler.function(regenerateDailyPuzzle).async()),
   })
   .authorization((allow) => [allow.resource(dailyTrends), allow.resource(regenerateDailyPuzzle)]);
 

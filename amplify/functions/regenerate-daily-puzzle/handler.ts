@@ -3,6 +3,7 @@ import { Amplify } from "aws-amplify";
 import { generateClient } from "aws-amplify/data";
 import { getAmplifyDataClientConfig } from "@aws-amplify/backend/function/runtime";
 import { env } from "$amplify/env/regenerate-daily-puzzle";
+import { isPuzzleReadyForPlay } from "../shared/puzzle/persist-puzzle";
 import { deriveStatusForDate, generateTrendPuzzle, puzzleDateId } from "../shared/trends";
 
 const { resourceConfig, libraryOptions } = await getAmplifyDataClientConfig(env);
@@ -15,6 +16,11 @@ function logJson(payload: Record<string, unknown>) {
   console.log(JSON.stringify({ source: "regenerate-daily-puzzle", ...payload }));
 }
 
+/**
+ * Invoked with `Event` (async) — the GraphQL mutation returns `{ success: true }` as soon
+ * as this function is **queued**; the client does not receive the puzzle in the response.
+ * Poll `DailyTrendPuzzle` for the given `id` (or check CloudWatch) for `computeState` and `items`.
+ */
 export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async (event) => {
   const id = String(event.arguments?.id || "").slice(0, 10);
   const requestedStatus = String(event.arguments?.status || "").toLowerCase();
@@ -22,22 +28,37 @@ export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async
   const sourceDate = String(event.arguments?.sourceDate || puzzleDateId(0)).slice(0, 10);
 
   if (!/^\d{4}-\d{2}-\d{2}$/.test(id)) {
-    return {
-      ok: false,
-      id: "",
-      message: "Invalid id format; expected YYYY-MM-DD",
-      itemCount: 0,
-      status: "",
-      topicSeed: "",
-      sourceDate: "",
-      timeframe: "",
-    };
+    logJson({ event: "regenerate_invalid_id", id });
+    return;
   }
 
   const todayId = puzzleDateId(0);
   const status = (requestedStatus === "active" || requestedStatus === "next" || requestedStatus === "archived")
     ? requestedStatus
     : deriveStatusForDate(id, todayId);
+
+  const pendingBase: Record<string, unknown> = {
+    id,
+    status,
+    scope: "global",
+    sourceDate,
+    topicSeed: topicSeed || "",
+    items: [] as unknown[],
+    timeframe: "now 7-d",
+    rankSource: "",
+    bqpRefreshDate: "",
+    regionKey: "",
+    computeState: "pending",
+  };
+  try {
+    await client.models.DailyTrendPuzzle.create(pendingBase as any, authOptions);
+  } catch {
+    try {
+      await client.models.DailyTrendPuzzle.update(pendingBase as any, authOptions);
+    } catch (e) {
+      logJson({ event: "regenerate_pending_write_failed", id, message: e instanceof Error ? e.message : String(e) });
+    }
+  }
 
   let generated;
   try {
@@ -49,16 +70,29 @@ export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async
   } catch (err: unknown) {
     const m = err instanceof Error ? err.message : String(err);
     logJson({ event: "regenerate_failed", id, message: m });
-    return {
-      ok: false,
-      message: `Failed generating trend puzzle: ${m}`,
+    const failPayload: Record<string, unknown> = {
       id,
-      itemCount: 0,
-      status: "",
+      status,
+      scope: "global",
+      sourceDate: sourceDate,
       topicSeed: "",
-      sourceDate: "",
-      timeframe: "",
+      items: [] as unknown[],
+      timeframe: "now 7-d",
+      rankSource: "",
+      bqpRefreshDate: "",
+      regionKey: "",
+      computeState: "failed",
     };
+    try {
+      await client.models.DailyTrendPuzzle.create(failPayload as any, authOptions);
+    } catch {
+      try {
+        await client.models.DailyTrendPuzzle.update(failPayload as any, authOptions);
+      } catch {
+        // no-op
+      }
+    }
+    return;
   }
 
   const payload: Record<string, unknown> = {
@@ -81,7 +115,7 @@ export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async
     await client.models.DailyTrendPuzzle.update(payload as any, authOptions);
   }
 
-  if (status === "active" || status === "next") {
+  if ((status === "active" || status === "next") && isPuzzleReadyForPlay(payload as any)) {
     try {
       const { data } = await client.models.DailyTrendPuzzle.list(authOptions);
       const all = Array.isArray(data) ? data : [];
@@ -100,13 +134,4 @@ export const handler: Schema["regenerateDailyPuzzle"]["functionHandler"] = async
   }
 
   logJson({ event: "regenerate_ok", id, status, itemCount: generated.items.length });
-  return {
-    ok: true,
-    id,
-    status,
-    topicSeed: generated.topicSeed,
-    sourceDate: generated.sourceDate,
-    itemCount: generated.items.length,
-    timeframe: generated.timeframe,
-  };
 };
